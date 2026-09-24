@@ -103,12 +103,30 @@ export function parseTurn(raw: unknown): Turn | null {
 }
 
 /**
+ * Intersect turn.awaiting with current roster ids (case-insensitive).
+ * Server leave does not prune awaiting — drop departed handles client-side.
+ */
+export function filterAwaitingByRoster(
+  awaiting: string[] | undefined,
+  roster: RosterEntry[] | null | undefined,
+): string[] {
+  const ids = awaiting ?? [];
+  if (ids.length === 0) return [];
+  if (!roster || roster.length === 0) return [];
+  return ids.filter((id) =>
+    roster.some((r) => sameParticipantId(r.id, id)),
+  );
+}
+
+/**
  * Quiet status copy for the composer strip.
- * Returns null when there is nothing useful to show (e.g. open / unknown).
+ * Returns null when there is nothing useful to show (e.g. open / unknown,
+ * or input-required with no still-present awaiters).
  */
 export function formatTurnStatus(
   handle: string,
   turn: Turn | null | undefined,
+  roster?: RosterEntry[] | null,
 ): string | null {
   if (!turn) return null;
   const state = turn.state;
@@ -116,7 +134,7 @@ export function formatTurnStatus(
   if (state === 'completed') return 'Completed';
   if (state === 'dormant') return 'Dormant';
   if (state === 'input-required') {
-    const awaiting = turn.awaiting ?? [];
+    const awaiting = filterAwaitingByRoster(turn.awaiting, roster);
     if (awaiting.length === 0) return null;
     const mine = awaiting.some((id) => sameParticipantId(id, handle));
     if (mine) return 'Your turn';
