@@ -1,1 +1,1 @@
-@/workspace/lyceum-commons-mobile/src/api/openClient.ts
+LOADING_FROM_DISK_VIA_PYTHON_NEXT
