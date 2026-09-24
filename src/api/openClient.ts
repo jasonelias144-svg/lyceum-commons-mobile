@@ -1,1 +1,1 @@
-PLACEHOLDER2
+@/workspace/lyceum-commons-mobile/src/api/openClient.ts
