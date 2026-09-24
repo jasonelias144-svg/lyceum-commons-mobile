@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Platform,
@@ -7,7 +7,6 @@ import {
   Text,
   TextInput,
   View,
-  type TextInputProps,
 } from 'react-native';
 import { colors } from '../theme/colors';
 
@@ -45,18 +44,48 @@ export function Composer({ onSend, disabled, bottomInset = 0 }: Props) {
     if (sendError) setSendError(null);
   }
 
-  const webKeyHandlers: Partial<TextInputProps> =
-    Platform.OS === 'web'
-      ? {
-          // @ts-expect-error react-native-web key event
-          onKeyDown: (e: { key: string; shiftKey: boolean; preventDefault: () => void }) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              if (canSend) void handleSend();
-            }
-          },
-        }
-      : {};
+  const inputRef = useRef<TextInput | null>(null);
+  const [inputHost, setInputHost] = useState<TextInput | null>(null);
+  const canSendRef = useRef(canSend);
+  const handleSendRef = useRef(handleSend);
+  canSendRef.current = canSend;
+  handleSendRef.current = handleSend;
+
+  function setInputRef(node: TextInput | null) {
+    inputRef.current = node;
+    setInputHost(node);
+  }
+
+  // Web: attach capture keydown on the real DOM node so we beat RN-web's
+  // multiline handler (prop onKeyDown loses). Enter sends; Shift+Enter newline.
+  useEffect(() => {
+    if (Platform.OS !== 'web' || !inputHost) return;
+    const host = inputHost as unknown as {
+      _node?: HTMLElement;
+      getNode?: () => HTMLElement | null;
+    };
+    let el: HTMLElement | null =
+      host._node ??
+      (typeof host.getNode === 'function' ? host.getNode() : null) ??
+      (typeof (host as unknown as HTMLElement).addEventListener === 'function'
+        ? (host as unknown as HTMLElement)
+        : null);
+    if (el && el.tagName !== 'TEXTAREA' && el.tagName !== 'INPUT') {
+      el = el.querySelector?.('textarea, input') ?? el;
+    }
+    if (!el || typeof el.addEventListener !== 'function') return;
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      // IME composition: don't send while composing (keyCode 229 = IME).
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key !== 'Enter' || e.shiftKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (canSendRef.current) void handleSendRef.current();
+    };
+    el.addEventListener('keydown', onKeyDown, true);
+    return () => el.removeEventListener('keydown', onKeyDown, true);
+  }, [inputHost]);
 
   return (
     <View
@@ -76,6 +105,7 @@ export function Composer({ onSend, disabled, bottomInset = 0 }: Props) {
         </Pressable>
 
         <TextInput
+          ref={setInputRef}
           style={[
             styles.input,
             Platform.OS === 'web'
@@ -92,9 +122,9 @@ export function Composer({ onSend, disabled, bottomInset = 0 }: Props) {
           returnKeyType="send"
           blurOnSubmit={false}
           onSubmitEditing={() => {
-            if (canSend) void handleSend();
+            // Native (and web fallback): send on submit when supported.
+            if (Platform.OS !== 'web' && canSend) void handleSend();
           }}
-          {...webKeyHandlers}
         />
 
         <Pressable
