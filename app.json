@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "Lyceum Commons Open",
+    "slug": "lyceum-commons-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#000000"
+      },
+      "predictiveBackGestureEnabled": false
+    }
+  }
+}
