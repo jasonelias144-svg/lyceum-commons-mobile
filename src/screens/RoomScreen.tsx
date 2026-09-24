@@ -44,6 +44,7 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [leaveError, setLeaveError] = useState<string | null>(null);
+  const [rejoinError, setRejoinError] = useState<string | null>(null);
   const [leaving, setLeaving] = useState(false);
 
   const listRef = useRef<FlatList<OpenMessage>>(null);
@@ -170,13 +171,24 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
         }
       } else if (next === 'active') {
         if (leftForBackgroundRef.current && sessionActiveRef.current) {
-          leftForBackgroundRef.current = false;
+          // Keep polling paused (leftForBackgroundRef true) until rejoin succeeds.
           void (async () => {
             try {
               await joinRoom(roomId, handle);
+              if (!mountedRef.current) return;
+              leftForBackgroundRef.current = false;
+              setRejoinError(null);
               await refresh({ full: true });
-            } catch {
-              // stay in UI; next poll / user action will surface errors
+            } catch (e) {
+              if (!mountedRef.current) return;
+              // Flag stays true → poll remains paused while not joined.
+              const msg =
+                e instanceof OpenApiError
+                  ? e.message
+                  : e instanceof Error
+                    ? e.message
+                    : "Couldn't rejoin. Try again.";
+              setRejoinError(msg);
             }
           })();
         }
@@ -193,6 +205,25 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
     nearBottomRef.current = distance < NEAR_BOTTOM_PX;
     if (initialScrollPendingRef.current && distance < NEAR_BOTTOM_PX) {
       // User (or our initial scroll) is at bottom — allow settle soon.
+    }
+  }
+
+  async function retryRejoin() {
+    try {
+      await joinRoom(roomId, handle);
+      if (!mountedRef.current) return;
+      leftForBackgroundRef.current = false;
+      setRejoinError(null);
+      await refresh({ full: true });
+    } catch (e) {
+      if (!mountedRef.current) return;
+      const msg =
+        e instanceof OpenApiError
+          ? e.message
+          : e instanceof Error
+            ? e.message
+            : "Couldn't rejoin. Try again.";
+      setRejoinError(msg);
     }
   }
 
@@ -296,6 +327,20 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
             />
           )}
         </View>
+
+        {rejoinError ? (
+          <View style={styles.leaveErrorRow}>
+            <Text style={styles.leaveErrorText}>{rejoinError}</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Retry rejoin"
+              onPress={() => void retryRejoin()}
+              hitSlop={8}
+            >
+              <Text style={styles.leaveErrorAction}>Retry</Text>
+            </Pressable>
+          </View>
+        ) : null}
 
         {leaveError ? (
           <View style={styles.leaveErrorRow}>
