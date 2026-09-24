@@ -1,1 +1,1 @@
-PLACEHOLDER_LOAD_OC
+@/workspace/lyceum-commons-mobile/src/api/openClient.ts
