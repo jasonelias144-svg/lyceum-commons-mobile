@@ -1,22 +1,26 @@
 import React, { useState } from 'react';
 import {
   ActivityIndicator,
+  Platform,
   Pressable,
   StyleSheet,
   Text,
   TextInput,
   View,
+  type TextInputProps,
 } from 'react-native';
 import { colors } from '../theme/colors';
 
 type Props = {
   onSend: (body: string) => Promise<void> | void;
   disabled?: boolean;
+  bottomInset?: number;
 };
 
-export function Composer({ onSend, disabled }: Props) {
+export function Composer({ onSend, disabled, bottomInset = 0 }: Props) {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
 
   const canSend =
     !disabled && !sending && draft.trim().length > 0 && draft.length <= 4000;
@@ -28,13 +32,38 @@ export function Composer({ onSend, disabled }: Props) {
     try {
       await onSend(body);
       setDraft('');
+      setSendError(null);
+    } catch {
+      setSendError("Couldn't send. Try again.");
     } finally {
       setSending(false);
     }
   }
 
+  function onChangeDraft(text: string) {
+    setDraft(text);
+    if (sendError) setSendError(null);
+  }
+
+  const webKeyHandlers: Partial<TextInputProps> =
+    Platform.OS === 'web'
+      ? {
+          // @ts-expect-error react-native-web key event
+          onKeyDown: (e: { key: string; shiftKey: boolean; preventDefault: () => void }) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              if (canSend) void handleSend();
+            }
+          },
+        }
+      : {};
+
   return (
-    <View style={styles.wrap} pointerEvents="box-none">
+    <View
+      style={[styles.wrap, { paddingBottom: Math.max(10, bottomInset) }]}
+      pointerEvents="box-none"
+    >
+      {sendError ? <Text style={styles.sendError}>{sendError}</Text> : null}
       <View style={styles.pill}>
         <Pressable
           accessibilityRole="button"
@@ -47,9 +76,14 @@ export function Composer({ onSend, disabled }: Props) {
         </Pressable>
 
         <TextInput
-          style={styles.input}
+          style={[
+            styles.input,
+            Platform.OS === 'web'
+              ? ({ outlineStyle: 'none', outlineWidth: 0 } as object)
+              : null,
+          ]}
           value={draft}
-          onChangeText={setDraft}
+          onChangeText={onChangeDraft}
           placeholder="Message"
           placeholderTextColor={colors.placeholder}
           multiline
@@ -60,16 +94,17 @@ export function Composer({ onSend, disabled }: Props) {
           onSubmitEditing={() => {
             if (canSend) void handleSend();
           }}
+          {...webKeyHandlers}
         />
 
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Microphone (unavailable)"
           disabled
-          style={styles.stub}
+          style={styles.stubMic}
           hitSlop={8}
         >
-          <Text style={styles.stubGlyph}>◦</Text>
+          <Text style={styles.micGlyph}>◉</Text>
         </Pressable>
 
         <Pressable
@@ -96,8 +131,15 @@ export function Composer({ onSend, disabled }: Props) {
 const styles = StyleSheet.create({
   wrap: {
     paddingHorizontal: 14,
-    paddingBottom: 10,
     paddingTop: 6,
+  },
+  sendError: {
+    color: colors.textMuted,
+    fontSize: 13,
+    lineHeight: 18,
+    textAlign: 'center',
+    marginBottom: 6,
+    paddingHorizontal: 8,
   },
   pill: {
     flexDirection: 'row',
@@ -120,10 +162,23 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     opacity: 0.4,
   },
+  stubMic: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    opacity: 0.7,
+  },
   stubGlyph: {
     color: colors.textMuted,
     fontSize: 20,
     fontWeight: '300',
+  },
+  micGlyph: {
+    color: colors.textMuted,
+    fontSize: 16,
+    fontWeight: '400',
   },
   input: {
     flex: 1,
