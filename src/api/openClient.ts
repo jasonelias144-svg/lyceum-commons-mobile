@@ -1,1 +1,1 @@
-file:///workspace/lyceum-commons-mobile/src/api/openClient.ts
+$include:/tmp/oc_only.ts
