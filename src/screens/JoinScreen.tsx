@@ -15,6 +15,7 @@ import {
   WELCOME_ROOM_ID,
   getApiBase,
   joinRoom,
+  sanitizeHandle,
 } from '../api/openClient';
 import { colors } from '../theme/colors';
 
@@ -27,7 +28,7 @@ export function JoinScreen({ onJoined }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const trimmed = handle.trim();
+  const trimmed = sanitizeHandle(handle);
   const canJoin = trimmed.length > 0 && trimmed.length <= 40 && !busy;
 
   async function handleJoin() {
@@ -54,7 +55,7 @@ export function JoinScreen({ onJoined }: Props) {
     <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
       <KeyboardAvoidingView
         style={styles.flex}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       >
         <View style={styles.inner}>
           <Text style={styles.kicker}>Open</Text>
@@ -64,7 +65,12 @@ export function JoinScreen({ onJoined }: Props) {
           </Text>
 
           <TextInput
-            style={styles.input}
+            style={[
+              styles.input,
+              Platform.OS === 'web'
+                ? ({ outlineStyle: 'none', outlineWidth: 0 } as object)
+                : null,
+            ]}
             value={handle}
             onChangeText={setHandle}
             placeholder="Handle"
@@ -167,7 +173,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   buttonLabelDisabled: {
-    color: colors.textDim,
+    color: colors.textMuted,
   },
   meta: {
     marginTop: 28,
