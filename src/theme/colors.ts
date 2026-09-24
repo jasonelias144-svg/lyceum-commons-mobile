@@ -11,7 +11,8 @@ export const colors = {
   textDim: '#6a6a6a',
   textFaint: '#555555',
   placeholder: '#666666',
-  disabled: '#444444',
+  /** Slightly lighter than before so disabled chrome stays readable. */
+  disabled: '#555555',
   white: '#ffffff',
   black: '#000000',
 } as const;
