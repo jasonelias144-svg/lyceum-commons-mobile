@@ -146,9 +146,14 @@ async function request<T>(
   return parsed as T;
 }
 
-/** Strip zero-width / invisible characters then trim. */
+/** Strip zero-width / invisible / bidi control characters then trim. */
 export function sanitizeHandle(raw: string): string {
-  return raw.replace(/[\u200B-\u200D\uFEFF\u2060]/g, '').trim();
+  return raw
+    .replace(
+      /[\u00AD\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/g,
+      '',
+    )
+    .trim();
 }
 
 /** POST /rooms/:id/join { party: "human", handle } */
