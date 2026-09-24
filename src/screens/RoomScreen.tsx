@@ -1,1 +1,1 @@
-PLACEHOLDER_LOAD_RS
+file:///workspace/lyceum-commons-mobile/src/screens/RoomScreen.tsx
