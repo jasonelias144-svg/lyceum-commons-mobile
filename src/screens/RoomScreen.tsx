@@ -6,7 +6,6 @@ import {
   KeyboardAvoidingView,
   Platform,
   Pressable,
-  StyleSheet,
   Text,
   View,
   type AppStateStatus,
@@ -16,21 +15,29 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   OpenApiError,
+  STALE_TURN_HEAL_POLLS,
+  formatTurnStatus,
   joinRoom,
   leaveRoom,
   leaveRoomBestEffort,
   listMessages,
+  parseTurn,
   postMessage,
+  shouldAcceptTurn,
+  turnFingerprint,
+  turnsEqual,
   type OpenMessage,
+  type RosterEntry,
+  type RoomVisibility,
+  type Turn,
 } from '../api/openClient';
 import { Composer } from '../components/Composer';
 import { MessageRow } from '../components/MessageRow';
 import { colors } from '../theme/colors';
+import { LIST_BOTTOM_PAD, styles } from './roomScreenStyles';
 
 const NEAR_BOTTOM_PX = 80;
 const POLL_MS = 4000;
-/** Extra list padding so the last message clears the floating pill. */
-const LIST_BOTTOM_PAD = 80;
 
 type Props = {
   roomId: string;
@@ -46,6 +53,9 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
   const [leaveError, setLeaveError] = useState<string | null>(null);
   const [rejoinError, setRejoinError] = useState<string | null>(null);
   const [leaving, setLeaving] = useState(false);
+  const [visibility, setVisibility] = useState<RoomVisibility | string | null>(null);
+  const [turn, setTurn] = useState<Turn | null>(null);
+  const [roster, setRoster] = useState<RosterEntry[]>([]);
 
   const listRef = useRef<FlatList<OpenMessage>>(null);
   const nearBottomRef = useRef(true);
@@ -55,6 +65,19 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
   const lastMessageIdRef = useRef<string | undefined>(undefined);
   const leftForBackgroundRef = useRef(false);
   const sessionActiveRef = useRef(true);
+  /** Wall time of the latest post send start — stale polls begun before this skip turn. */
+  const lastPostAtRef = useRef(0);
+  /** Latest turn we applied (ref so poll can compare without stale closure). */
+  const turnRef = useRef<Turn | null>(null);
+  /**
+   * Self-heal: after a stamped turn is held, older/unstamped polls are rejected.
+   * If the *same* rejected body arrives on N consecutive *fresh* polls (~12s),
+   * accept it (server redeploy / clock skew without remount).
+   */
+  const staleTurnHealRef = useRef<{ key: string; count: number }>({
+    key: '',
+    count: 0,
+  });
 
   const scrollToEndQuiet = useCallback((animated = true) => {
     requestAnimationFrame(() => {
@@ -64,6 +87,7 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
 
   const refresh = useCallback(
     async (opts?: { initial?: boolean; forceScroll?: boolean; full?: boolean }) => {
+      const startedAt = Date.now();
       try {
         const after =
           !opts?.initial && !opts?.full && lastMessageIdRef.current
@@ -97,6 +121,50 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
           const next = res.messages ?? [];
           setMessages(next);
           lastMessageIdRef.current = next[next.length - 1]?.id;
+        }
+
+        // Room meta (turn + roster + visibility) is atomic: a stale poll
+        // (started before the latest post) drops the whole meta update —
+        // messages still append via the `after` cursor above. Roster is only
+        // applied when the turn is accepted or equal, so a rejected turn cannot
+        // blank the status line by filtering awaiting against a thinner roster.
+        const pollStaleVsPost = startedAt < lastPostAtRef.current;
+        if (!pollStaleVsPost) {
+          const nextTurn = parseTurn(res.turn);
+          const current = turnRef.current;
+          let applyMeta = false;
+          if (nextTurn) {
+            const accepted =
+              shouldAcceptTurn(nextTurn, current) || turnsEqual(nextTurn, current);
+            if (accepted) {
+              applyMeta = true;
+              staleTurnHealRef.current = { key: '', count: 0 };
+            } else {
+              // Older/unstamped vs held stamp — count consecutive identical rejects.
+              const key = turnFingerprint(nextTurn);
+              const heal = staleTurnHealRef.current;
+              if (key && key === heal.key) {
+                heal.count += 1;
+              } else {
+                staleTurnHealRef.current = { key, count: 1 };
+              }
+              if (staleTurnHealRef.current.count >= STALE_TURN_HEAL_POLLS) {
+                // Mid-session recovery after store reset / clock skew.
+                applyMeta = true;
+                staleTurnHealRef.current = { key: '', count: 0 };
+              }
+            }
+          }
+          if (applyMeta && nextTurn) {
+            turnRef.current = nextTurn;
+            setTurn(nextTurn);
+            if (typeof res.visibility === 'string' && res.visibility.length > 0) {
+              setVisibility(res.visibility);
+            }
+            if (Array.isArray(res.roster)) {
+              setRoster(res.roster);
+            }
+          }
         }
 
         setError(null);
@@ -228,7 +296,14 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
   }
 
   async function handleSend(body: string) {
-    await postMessage(roomId, handle, body);
+    lastPostAtRef.current = Date.now();
+    const posted = await postMessage(roomId, handle, body);
+    const nextTurn = parseTurn(posted.turn);
+    if (nextTurn && shouldAcceptTurn(nextTurn, turnRef.current)) {
+      turnRef.current = nextTurn;
+      setTurn(nextTurn);
+      staleTurnHealRef.current = { key: '', count: 0 };
+    }
     nearBottomRef.current = true;
     await refresh({ forceScroll: true });
   }
@@ -263,6 +338,8 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
     onLeave();
   }
 
+  const turnLine = formatTurnStatus(handle, turn, roster);
+
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
       <KeyboardAvoidingView
@@ -276,7 +353,7 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
               Open · {roomId}
             </Text>
             <Text style={styles.headerHandle} numberOfLines={1}>
-              {handle}
+              {visibility ? `${handle} · ${visibility}` : handle}
             </Text>
           </View>
           <Pressable
@@ -365,6 +442,16 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
           </View>
         ) : null}
 
+        {turnLine ? (
+          <Text
+            style={styles.turnStatus}
+            numberOfLines={1}
+            ellipsizeMode="tail"
+          >
+            {turnLine}
+          </Text>
+        ) : null}
+
         <Composer
           onSend={handleSend}
           disabled={loading}
@@ -374,94 +461,3 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
     </SafeAreaView>
   );
 }
-
-const styles = StyleSheet.create({
-  safe: {
-    flex: 1,
-    backgroundColor: colors.bg,
-  },
-  flex: { flex: 1 },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.borderSubtle,
-    backgroundColor: colors.bg,
-    gap: 12,
-  },
-  headerText: {
-    flex: 1,
-    gap: 2,
-  },
-  headerTitle: {
-    color: colors.text,
-    fontSize: 14,
-    fontWeight: '500',
-    letterSpacing: 0.2,
-  },
-  headerHandle: {
-    color: colors.textDim,
-    fontSize: 12,
-  },
-  leaveBtn: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-  },
-  leaveLabel: {
-    color: colors.textMuted,
-    fontSize: 13,
-  },
-  stream: {
-    flex: 1,
-    backgroundColor: colors.bgNear,
-  },
-  listContent: {
-    paddingVertical: 8,
-    paddingBottom: LIST_BOTTOM_PAD,
-  },
-  emptyList: {
-    flexGrow: 1,
-    justifyContent: 'center',
-    padding: 24,
-  },
-  center: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  empty: {
-    color: colors.textDim,
-    fontSize: 15,
-    textAlign: 'center',
-  },
-  errorBanner: {
-    color: colors.textMuted,
-    fontSize: 13,
-    textAlign: 'center',
-    padding: 16,
-  },
-  leaveErrorRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-  },
-  leaveErrorText: {
-    color: colors.textMuted,
-    fontSize: 13,
-  },
-  leaveErrorAction: {
-    color: colors.text,
-    fontSize: 13,
-    fontWeight: '500',
-  },
-  leaveErrorActionMuted: {
-    color: colors.textDim,
-    fontSize: 13,
-  },
-});
