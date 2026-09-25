@@ -3,14 +3,30 @@ import { StyleSheet, Text, View } from 'react-native';
 import type { OpenMessage } from '../api/openClient';
 import { colors } from '../theme/colors';
 
+function sameCalendarDay(a: Date, b: Date): boolean {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
 function formatTime(iso: string): string {
   try {
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return iso;
-    return d.toLocaleTimeString(undefined, {
+    const time = d.toLocaleTimeString(undefined, {
       hour: 'numeric',
       minute: '2-digit',
     });
+    if (sameCalendarDay(d, new Date())) {
+      return time;
+    }
+    const date = d.toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+    });
+    return `${date} ${time}`;
   } catch {
     return iso;
   }

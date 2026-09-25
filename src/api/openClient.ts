@@ -146,6 +146,16 @@ async function request<T>(
   return parsed as T;
 }
 
+/** Strip zero-width / invisible / bidi control characters then trim. */
+export function sanitizeHandle(raw: string): string {
+  return raw
+    .replace(
+      /[\u00AD\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/g,
+      '',
+    )
+    .trim();
+}
+
 /** POST /rooms/:id/join { party: "human", handle } */
 export async function joinRoom(
   roomId: string,
@@ -156,7 +166,7 @@ export async function joinRoom(
   });
 }
 
-/** GET /rooms/:id/messages?handle= */
+/** GET /rooms/:id/messages?handle=&after= */
 export async function listMessages(
   roomId: string,
   handle: string,
@@ -180,7 +190,7 @@ export async function postMessage(
   });
 }
 
-/** POST /rooms/:id/leave { handle } — optional for M1 */
+/** POST /rooms/:id/leave { handle } */
 export async function leaveRoom(
   roomId: string,
   handle: string,
@@ -188,6 +198,39 @@ export async function leaveRoom(
   return request<LeaveResponse>('POST', `/rooms/${encodeURIComponent(roomId)}/leave`, {
     body: { handle },
   });
+}
+
+/**
+ * Best-effort leave for unload / background (sendBeacon or keepalive fetch).
+ * Does not throw; fire-and-forget.
+ */
+export function leaveRoomBestEffort(roomId: string, handle: string): void {
+  const url = openUrl(`/rooms/${encodeURIComponent(roomId)}/leave`);
+  const payload = JSON.stringify({ handle });
+  try {
+    if (
+      typeof navigator !== 'undefined' &&
+      typeof navigator.sendBeacon === 'function'
+    ) {
+      const blob = new Blob([payload], { type: 'application/json' });
+      if (navigator.sendBeacon(url, blob)) return;
+    }
+  } catch {
+    // fall through to keepalive fetch
+  }
+  try {
+    void fetch(url, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: payload,
+      keepalive: true,
+    });
+  } catch {
+    // ignore — best effort
+  }
 }
 
 export function getApiBase(): string {

@@ -12,7 +12,8 @@
       "adaptiveIcon": {
         "backgroundColor": "#000000"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "softwareKeyboardLayoutMode": "resize"
     }
   }
 }

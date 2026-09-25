@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Platform,
   Pressable,
   StyleSheet,
   Text,
@@ -12,11 +13,13 @@ import { colors } from '../theme/colors';
 type Props = {
   onSend: (body: string) => Promise<void> | void;
   disabled?: boolean;
+  bottomInset?: number;
 };
 
-export function Composer({ onSend, disabled }: Props) {
+export function Composer({ onSend, disabled, bottomInset = 0 }: Props) {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
 
   const canSend =
     !disabled && !sending && draft.trim().length > 0 && draft.length <= 4000;
@@ -28,13 +31,68 @@ export function Composer({ onSend, disabled }: Props) {
     try {
       await onSend(body);
       setDraft('');
+      setSendError(null);
+    } catch {
+      setSendError("Couldn't send. Try again.");
     } finally {
       setSending(false);
     }
   }
 
+  function onChangeDraft(text: string) {
+    setDraft(text);
+    if (sendError) setSendError(null);
+  }
+
+  const inputRef = useRef<TextInput | null>(null);
+  const [inputHost, setInputHost] = useState<TextInput | null>(null);
+  const canSendRef = useRef(canSend);
+  const handleSendRef = useRef(handleSend);
+  canSendRef.current = canSend;
+  handleSendRef.current = handleSend;
+
+  function setInputRef(node: TextInput | null) {
+    inputRef.current = node;
+    setInputHost(node);
+  }
+
+  // Web: attach capture keydown on the real DOM node so we beat RN-web's
+  // multiline handler (prop onKeyDown loses). Enter sends; Shift+Enter newline.
+  useEffect(() => {
+    if (Platform.OS !== 'web' || !inputHost) return;
+    const host = inputHost as unknown as {
+      _node?: HTMLElement;
+      getNode?: () => HTMLElement | null;
+    };
+    let el: HTMLElement | null =
+      host._node ??
+      (typeof host.getNode === 'function' ? host.getNode() : null) ??
+      (typeof (host as unknown as HTMLElement).addEventListener === 'function'
+        ? (host as unknown as HTMLElement)
+        : null);
+    if (el && el.tagName !== 'TEXTAREA' && el.tagName !== 'INPUT') {
+      el = el.querySelector?.('textarea, input') ?? el;
+    }
+    if (!el || typeof el.addEventListener !== 'function') return;
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      // IME composition: don't send while composing (keyCode 229 = IME).
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key !== 'Enter' || e.shiftKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (canSendRef.current) void handleSendRef.current();
+    };
+    el.addEventListener('keydown', onKeyDown, true);
+    return () => el.removeEventListener('keydown', onKeyDown, true);
+  }, [inputHost]);
+
   return (
-    <View style={styles.wrap} pointerEvents="box-none">
+    <View
+      style={[styles.wrap, { paddingBottom: Math.max(10, bottomInset) }]}
+      pointerEvents="box-none"
+    >
+      {sendError ? <Text style={styles.sendError}>{sendError}</Text> : null}
       <View style={styles.pill}>
         <Pressable
           accessibilityRole="button"
@@ -47,9 +105,15 @@ export function Composer({ onSend, disabled }: Props) {
         </Pressable>
 
         <TextInput
-          style={styles.input}
+          ref={setInputRef}
+          style={[
+            styles.input,
+            Platform.OS === 'web'
+              ? ({ outlineStyle: 'none', outlineWidth: 0 } as object)
+              : null,
+          ]}
           value={draft}
-          onChangeText={setDraft}
+          onChangeText={onChangeDraft}
           placeholder="Message"
           placeholderTextColor={colors.placeholder}
           multiline
@@ -58,7 +122,8 @@ export function Composer({ onSend, disabled }: Props) {
           returnKeyType="send"
           blurOnSubmit={false}
           onSubmitEditing={() => {
-            if (canSend) void handleSend();
+            // Native (and web fallback): send on submit when supported.
+            if (Platform.OS !== 'web' && canSend) void handleSend();
           }}
         />
 
@@ -66,10 +131,10 @@ export function Composer({ onSend, disabled }: Props) {
           accessibilityRole="button"
           accessibilityLabel="Microphone (unavailable)"
           disabled
-          style={styles.stub}
+          style={styles.stubMic}
           hitSlop={8}
         >
-          <Text style={styles.stubGlyph}>◦</Text>
+          <Text style={styles.micGlyph}>◉</Text>
         </Pressable>
 
         <Pressable
@@ -96,8 +161,15 @@ export function Composer({ onSend, disabled }: Props) {
 const styles = StyleSheet.create({
   wrap: {
     paddingHorizontal: 14,
-    paddingBottom: 10,
     paddingTop: 6,
+  },
+  sendError: {
+    color: colors.textMuted,
+    fontSize: 13,
+    lineHeight: 18,
+    textAlign: 'center',
+    marginBottom: 6,
+    paddingHorizontal: 8,
   },
   pill: {
     flexDirection: 'row',
@@ -120,10 +192,23 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     opacity: 0.4,
   },
+  stubMic: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    opacity: 0.7,
+  },
   stubGlyph: {
     color: colors.textMuted,
     fontSize: 20,
     fontWeight: '300',
+  },
+  micGlyph: {
+    color: colors.textMuted,
+    fontSize: 16,
+    fontWeight: '400',
   },
   input: {
     flex: 1,
