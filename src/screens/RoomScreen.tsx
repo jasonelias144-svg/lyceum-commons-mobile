@@ -14,9 +14,12 @@ import {
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
+  HELD_NAME_NOTE,
   OpenApiError,
   STALE_TURN_HEAL_POLLS,
   formatTurnStatus,
+  isHandleTaken,
+  isIdentityLoss,
   joinRoom,
   leaveRoom,
   leaveRoomBestEffort,
@@ -39,13 +42,23 @@ import { LIST_BOTTOM_PAD, styles } from './roomScreenStyles';
 const NEAR_BOTTOM_PX = 80;
 const POLL_MS = 4000;
 
+/** Rejoin failed for a reason other than a held name. */
+const REJOIN_FAILED_NOTE = "Couldn't rejoin. Join again.";
+
 type Props = {
   roomId: string;
   handle: string;
   onLeave: () => void;
+  /**
+   * Identity could not be recovered (name held by someone else, or the silent
+   * rejoin failed): polling has stopped; go back to join with `note`.
+   */
+  onIdentityLost: (note: string) => void;
 };
 
-export function RoomScreen({ roomId, handle, onLeave }: Props) {
+type RejoinOutcome = 'rejoined' | 'exited';
+
+export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
   const insets = useSafeAreaInsets();
   const [messages, setMessages] = useState<OpenMessage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -78,6 +91,74 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
     key: '',
     count: 0,
   });
+  /**
+   * Silent rejoin (guest identity). Bumped each time a rejoin lands; a poll or
+   * post that started under an older generation and then fails with
+   * not_joined / guest_key_required is stale (sent before the rejoin) and is
+   * not counted as a second failure.
+   */
+  const rejoinGenRef = useRef(0);
+  /** Single-flight: concurrent failing polls share one rejoin. */
+  const rejoinInFlightRef = useRef<Promise<RejoinOutcome> | null>(null);
+  /**
+   * True after a silent rejoin until a poll/post started after it succeeds.
+   * Another identity loss in that window means the rejoin didn't stick —
+   * stop instead of looping.
+   */
+  const rejoinUnverifiedRef = useRef(false);
+  /** Generation we already re-polled for (one immediate poll per rejoin). */
+  const repolledGenRef = useRef(0);
+  const onIdentityLostRef = useRef(onIdentityLost);
+  onIdentityLostRef.current = onIdentityLost;
+
+  /** Stop polling and hand back to the join screen (name prefilled by App). */
+  const exitToJoin = useCallback((note: string) => {
+    if (!sessionActiveRef.current) return;
+    sessionActiveRef.current = false;
+    leftForBackgroundRef.current = false;
+    if (mountedRef.current) onIdentityLostRef.current(note);
+  }, []);
+
+  /**
+   * A human call made under generation `startGen` failed with not_joined /
+   * guest_key_required. Rejoin ONCE with the stored key (header added by the
+   * client). 409 handle_taken, any other rejoin failure, or a second identity
+   * loss before anything succeeds → back to join. No retry loop.
+   */
+  const recoverIdentity = useCallback(
+    async (startGen: number): Promise<RejoinOutcome> => {
+      if (!sessionActiveRef.current) return 'exited';
+      const inFlight = rejoinInFlightRef.current;
+      if (inFlight) return inFlight;
+      // A rejoin already landed after this call was sent — just carry on.
+      if (startGen !== rejoinGenRef.current) return 'rejoined';
+      if (rejoinUnverifiedRef.current) {
+        exitToJoin(HELD_NAME_NOTE);
+        return 'exited';
+      }
+      const attempt = (async (): Promise<RejoinOutcome> => {
+        try {
+          await joinRoom(roomId, handle);
+          rejoinGenRef.current += 1;
+          rejoinUnverifiedRef.current = true;
+          return 'rejoined';
+        } catch (e) {
+          exitToJoin(isHandleTaken(e) ? HELD_NAME_NOTE : REJOIN_FAILED_NOTE);
+          return 'exited';
+        } finally {
+          rejoinInFlightRef.current = null;
+        }
+      })();
+      rejoinInFlightRef.current = attempt;
+      return attempt;
+    },
+    [roomId, handle, exitToJoin],
+  );
+
+  /** A call started under `startGen` succeeded — the rejoin (if any) stuck. */
+  const markIdentityOk = useCallback((startGen: number) => {
+    if (startGen === rejoinGenRef.current) rejoinUnverifiedRef.current = false;
+  }, []);
 
   const scrollToEndQuiet = useCallback((animated = true) => {
     requestAnimationFrame(() => {
@@ -88,6 +169,7 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
   const refresh = useCallback(
     async (opts?: { initial?: boolean; forceScroll?: boolean; full?: boolean }) => {
       const startedAt = Date.now();
+      const startGen = rejoinGenRef.current;
       try {
         const after =
           !opts?.initial && !opts?.full && lastMessageIdRef.current
@@ -95,6 +177,7 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
             : undefined;
         const res = await listMessages(roomId, handle, after);
         if (!mountedRef.current || !sessionActiveRef.current) return;
+        markIdentityOk(startGen);
 
         if (after) {
           const incoming = res.messages ?? [];
@@ -178,7 +261,23 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
           }, 400);
         }
       } catch (e) {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || !sessionActiveRef.current) return;
+        if (isIdentityLoss(e)) {
+          // Expired / key not accepted: silent rejoin, no error banner. On
+          // success poll again right away; the `after` cursor is untouched so
+          // nothing is duplicated, and meta goes through the usual atomic path.
+          const outcome = await recoverIdentity(startGen);
+          if (
+            outcome === 'rejoined' &&
+            mountedRef.current &&
+            sessionActiveRef.current &&
+            repolledGenRef.current !== rejoinGenRef.current
+          ) {
+            repolledGenRef.current = rejoinGenRef.current;
+            void refresh(opts?.initial ? { initial: true } : undefined);
+          }
+          return;
+        }
         const msg =
           e instanceof OpenApiError
             ? e.message
@@ -190,7 +289,7 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
         if (mountedRef.current && opts?.initial) setLoading(false);
       }
     },
-    [roomId, handle, scrollToEndQuiet],
+    [roomId, handle, scrollToEndQuiet, recoverIdentity, markIdentityOk],
   );
 
   useEffect(() => {
@@ -208,21 +307,28 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
     };
   }, [refresh]);
 
-  // Web: best-effort leave on pagehide / beforeunload.
+  // Web: best-effort leave on pagehide / beforeunload — once per unload (both
+  // events fire on a normal close; a second leave would only 403). A page
+  // restored from bfcache re-arms it; its next poll silently rejoins.
   useEffect(() => {
     if (Platform.OS !== 'web') return;
-    const onPageHide = () => {
+    let sent = false;
+    const leaveOnce = () => {
+      if (sent || !sessionActiveRef.current) return;
+      sent = true;
       leaveRoomBestEffort(roomId, handle);
     };
-    const onBeforeUnload = () => {
-      leaveRoomBestEffort(roomId, handle);
+    const onPageShow = () => {
+      sent = false;
     };
     if (typeof window !== 'undefined') {
-      window.addEventListener('pagehide', onPageHide);
-      window.addEventListener('beforeunload', onBeforeUnload);
+      window.addEventListener('pagehide', leaveOnce);
+      window.addEventListener('beforeunload', leaveOnce);
+      window.addEventListener('pageshow', onPageShow);
       return () => {
-        window.removeEventListener('pagehide', onPageHide);
-        window.removeEventListener('beforeunload', onBeforeUnload);
+        window.removeEventListener('pagehide', leaveOnce);
+        window.removeEventListener('beforeunload', leaveOnce);
+        window.removeEventListener('pageshow', onPageShow);
       };
     }
     return undefined;
@@ -244,11 +350,17 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
             try {
               await joinRoom(roomId, handle);
               if (!mountedRef.current) return;
+              rejoinGenRef.current += 1;
+              rejoinUnverifiedRef.current = false;
               leftForBackgroundRef.current = false;
               setRejoinError(null);
               await refresh({ full: true });
             } catch (e) {
               if (!mountedRef.current) return;
+              if (isHandleTaken(e)) {
+                exitToJoin(HELD_NAME_NOTE);
+                return;
+              }
               // Flag stays true → poll remains paused while not joined.
               const msg =
                 e instanceof OpenApiError
@@ -264,7 +376,7 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
     };
     const sub = AppState.addEventListener('change', onChange);
     return () => sub.remove();
-  }, [roomId, handle, refresh]);
+  }, [roomId, handle, refresh, exitToJoin]);
 
   function onScroll(e: NativeSyntheticEvent<NativeScrollEvent>) {
     const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
@@ -280,11 +392,17 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
     try {
       await joinRoom(roomId, handle);
       if (!mountedRef.current) return;
+      rejoinGenRef.current += 1;
+      rejoinUnverifiedRef.current = false;
       leftForBackgroundRef.current = false;
       setRejoinError(null);
       await refresh({ full: true });
     } catch (e) {
       if (!mountedRef.current) return;
+      if (isHandleTaken(e)) {
+        exitToJoin(HELD_NAME_NOTE);
+        return;
+      }
       const msg =
         e instanceof OpenApiError
           ? e.message
@@ -295,9 +413,38 @@ export function RoomScreen({ roomId, handle, onLeave }: Props) {
     }
   }
 
-  async function handleSend(body: string) {
+  /** POST once; on identity loss rejoin once and retry the same post once. */
+  async function postWithRejoin(body: string) {
+    const startGen = rejoinGenRef.current;
     lastPostAtRef.current = Date.now();
-    const posted = await postMessage(roomId, handle, body);
+    try {
+      const posted = await postMessage(roomId, handle, body);
+      markIdentityOk(startGen);
+      return posted;
+    } catch (e) {
+      if (!isIdentityLoss(e)) throw e;
+      const outcome = await recoverIdentity(startGen);
+      if (outcome !== 'rejoined') throw e;
+      // Retry exactly once. A 403/401 was not stored server-side, so this
+      // cannot double-post.
+      const retryGen = rejoinGenRef.current;
+      lastPostAtRef.current = Date.now();
+      try {
+        const posted = await postMessage(roomId, handle, body);
+        markIdentityOk(retryGen);
+        return posted;
+      } catch (e2) {
+        if (isIdentityLoss(e2)) {
+          // Rejoined but still refused — don't loop.
+          exitToJoin(HELD_NAME_NOTE);
+        }
+        throw e2;
+      }
+    }
+  }
+
+  async function handleSend(body: string) {
+    const posted = await postWithRejoin(body);
     const nextTurn = parseTurn(posted.turn);
     if (nextTurn && shouldAcceptTurn(nextTurn, turnRef.current)) {
       turnRef.current = nextTurn;
