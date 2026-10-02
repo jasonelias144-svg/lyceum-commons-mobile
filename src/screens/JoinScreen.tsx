@@ -17,6 +17,7 @@ import {
   guestNameLimitNote,
   handleConflictNote,
   isGuestNameLimit,
+  isNameConflict,
   joinRoom,
   sanitizeHandle,
 } from '../api/openClient';
@@ -26,7 +27,7 @@ type Props = {
   onJoined: (handle: string, roomId: string) => void;
   /** Prefill after the room handed back (e.g. the name is held). */
   initialHandle?: string;
-  /** Short grey note shown under the field (e.g. HELD_NAME_NOTE). */
+  /** Short grey note shown under the field (e.g. the server's 409 message). */
   initialNote?: string;
 };
 
@@ -48,7 +49,7 @@ export function JoinScreen({ onJoined, initialHandle, initialNote }: Props) {
       onJoined(trimmed, WELCOME_ROOM_ID);
     } catch (e) {
       const msg =
-        e instanceof OpenApiError && e.status === 409
+        isNameConflict(e)
           ? handleConflictNote(e)
           : isGuestNameLimit(e)
             ? guestNameLimitNote(e)
