@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -18,9 +18,13 @@ import {
   handleConflictNote,
   isGuestNameLimit,
   isNameConflict,
+  isSlowDown,
   joinRoom,
   sanitizeHandle,
+  slowDownNote,
+  slowDownSecondsLeft,
 } from '../api/openClient';
+import { useWaitClock } from '../components/useWaitClock';
 import { colors } from '../theme/colors';
 
 type Props = {
@@ -35,19 +39,32 @@ export function JoinScreen({ onJoined, initialHandle, initialNote }: Props) {
   const [handle, setHandle] = useState(initialHandle ?? '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(initialNote ?? null);
+  /** A 429 on join: note (server text or live countdown); Join is off until the wait ends. */
+  const [slow, setSlow] = useState<OpenApiError | null>(null);
+  const now = useWaitClock(slow?.retryUntilMs);
+  const waiting = slow ? slowDownSecondsLeft(slow, now) > 0 : false;
+
+  useEffect(() => {
+    if (slow && slow.retryUntilMs != null && !waiting) setSlow(null);
+  }, [slow, waiting]);
 
   const trimmed = sanitizeHandle(handle);
-  const canJoin = trimmed.length > 0 && trimmed.length <= 40 && !busy;
+  const canJoin = trimmed.length > 0 && trimmed.length <= 40 && !busy && !waiting;
 
   async function handleJoin() {
     if (!canJoin) return;
     setBusy(true);
     setError(null);
+    setSlow(null);
     try {
       // Resolves only after a newly minted guest key is stored.
       await joinRoom(WELCOME_ROOM_ID, trimmed);
       onJoined(trimmed, WELCOME_ROOM_ID);
     } catch (e) {
+      if (isSlowDown(e)) {
+        setSlow(e as OpenApiError);
+        return;
+      }
       const msg =
         isNameConflict(e)
           ? handleConflictNote(e)
@@ -88,6 +105,7 @@ export function JoinScreen({ onJoined, initialHandle, initialNote }: Props) {
             onChangeText={(text) => {
               setHandle(text);
               if (error) setError(null);
+              if (slow && slow.retryUntilMs == null) setSlow(null);
             }}
             placeholder="Handle"
             placeholderTextColor={colors.placeholder}
@@ -100,7 +118,11 @@ export function JoinScreen({ onJoined, initialHandle, initialNote }: Props) {
             onSubmitEditing={() => void handleJoin()}
           />
 
-          {error ? <Text style={styles.error}>{error}</Text> : null}
+          {slow ? (
+            <Text style={styles.error}>{slowDownNote(slow, now)}</Text>
+          ) : error ? (
+            <Text style={styles.error}>{error}</Text>
+          ) : null}
 
           <Pressable
             accessibilityRole="button"
