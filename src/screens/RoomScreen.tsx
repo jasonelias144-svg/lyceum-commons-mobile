@@ -22,6 +22,7 @@ import {
   isGuestNameLimit,
   isIdentityLoss,
   isNameConflict,
+  clearWaits,
   isSlowDown,
   joinRoom,
   leaveRoom,
@@ -69,7 +70,7 @@ class StaleJoinError extends Error {
 }
 
 /**
- * How a failed (re)join ends. Null = retryable: a network error, a 5xx, or a
+ * How a failed (re)join ends. Null = retryable: a network error, a 5xx, a 408, or a
  * 429 slow-down (the client holds the join path until Retry-After passes,
  * and the next poll tick after that tries again). Anything else is terminal,
  * with the server's message whenever it sent one:
@@ -81,7 +82,7 @@ class StaleJoinError extends Error {
 function rejoinExitNote(e: unknown): string | null {
   if (e instanceof StaleJoinError) return null;
   if (!(e instanceof OpenApiError)) return null;
-  if (e.status >= 500) return null;
+  if (e.status >= 500 || e.status === 408) return null;
   if (isSlowDown(e)) return null;
   if (isNameConflict(e)) return handleConflictNote(e);
   if (isGuestNameLimit(e)) return guestNameLimitNote(e);
@@ -723,6 +724,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
     beginLeave();
     sessionActiveRef.current = false;
     leftForBackgroundRef.current = false;
+    clearWaits();
     void leaveRoomBestEffort(roomId, handle);
     onLeave();
   }
