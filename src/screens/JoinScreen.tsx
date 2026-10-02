@@ -14,7 +14,9 @@ import {
   OpenApiError,
   WELCOME_ROOM_ID,
   getApiBase,
+  guestNameLimitNote,
   handleConflictNote,
+  isGuestNameLimit,
   joinRoom,
   sanitizeHandle,
 } from '../api/openClient';
@@ -48,11 +50,13 @@ export function JoinScreen({ onJoined, initialHandle, initialNote }: Props) {
       const msg =
         e instanceof OpenApiError && e.status === 409
           ? handleConflictNote(e)
-          : e instanceof OpenApiError
-            ? e.message
-            : e instanceof Error
+          : isGuestNameLimit(e)
+            ? guestNameLimitNote(e)
+            : e instanceof OpenApiError
               ? e.message
-              : 'Join failed';
+              : e instanceof Error
+                ? e.message
+                : 'Join failed';
       setError(msg);
     } finally {
       setBusy(false);

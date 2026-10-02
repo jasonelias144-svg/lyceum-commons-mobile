@@ -236,27 +236,62 @@ export function isHandleTaken(e: unknown): boolean {
 }
 
 /**
- * Copy for a 409 on join. The held-name note only when we sent a guest key
- * (the server has guest identity, so handle_taken means another key holds
- * it). Keyless (e.g. a server without guest identity, where a lookalike-name
- * 409 means something else): the server's own JSON `message`, then `error`
- * (string, or `error.message`), else the held note.
+ * The server's own text for an error body. Bodies are nested
+ * (`{ error: { code, message } }`): `error.message` first, then a top-level
+ * `message`, then a top-level `error` string. Undefined when none is usable.
+ */
+export function serverErrorMessage(e: unknown): string | undefined {
+  if (!(e instanceof OpenApiError)) return undefined;
+  const p = e.payload && typeof e.payload === 'object' ? (e.payload as Record<string, unknown>) : {};
+  const err = p.error;
+  const nested =
+    err && typeof err === 'object' ? (err as { message?: unknown }).message : undefined;
+  for (const v of [nested, p.message, typeof err === 'string' ? err : undefined]) {
+    if (typeof v === 'string' && v.trim().length > 0) return v.trim();
+  }
+  return undefined;
+}
+
+/**
+ * The server's generic handle_taken wording (a lookalike or another key holds
+ * the name). For these a keyed join shows the shorter {@link HELD_NAME_NOTE};
+ * any other server text is more specific (e.g. a pre-guest-key name that is
+ * still present: "join with it again once it has been away …") and is shown.
+ */
+const GENERIC_TAKEN_RE = /^that name, or one that looks the same,/i;
+
+/**
+ * Copy for a 409 on join / rejoin.
+ * - Keyed handle_taken: the held-name note, unless the server's message is
+ *   more specific than its generic wording — then the server's message.
+ * - Keyless (no guest key was sent, so "held by someone else" may be wrong):
+ *   the server's own message (`error.message`, then `message`), else the
+ *   held note.
  */
 export function handleConflictNote(e: unknown): string {
   if (!(e instanceof OpenApiError)) return HELD_NAME_NOTE;
-  if (e.sentGuestKey && isHandleTaken(e)) return HELD_NAME_NOTE;
-  const p = e.payload && typeof e.payload === 'object' ? (e.payload as Record<string, unknown>) : {};
-  const err = p.error;
-  const fromErr =
-    typeof err === 'string'
-      ? err
-      : err && typeof err === 'object'
-        ? (err as { message?: unknown }).message
-        : undefined;
-  for (const v of [p.message, fromErr]) {
-    if (typeof v === 'string' && v.trim().length > 0) return v.trim();
+  const msg = serverErrorMessage(e);
+  if (e.sentGuestKey && isHandleTaken(e)) {
+    return msg && !GENERIC_TAKEN_RE.test(msg) ? msg : HELD_NAME_NOTE;
   }
-  return HELD_NAME_NOTE;
+  return msg ?? HELD_NAME_NOTE;
+}
+
+/** Fallback copy for 403 guest_name_limit when the body carries no message. */
+export const GUEST_NAME_LIMIT_NOTE =
+  "You're already using 5 names. Leave one to join with another.";
+
+/**
+ * 403 guest_name_limit — this guest key already holds the maximum number of
+ * names. Not identity loss: never a reason to (silently) rejoin.
+ */
+export function isGuestNameLimit(e: unknown): boolean {
+  return e instanceof OpenApiError && e.code === 'guest_name_limit';
+}
+
+/** Plain note for guest_name_limit: the server's message, else the fallback. */
+export function guestNameLimitNote(e: unknown): string {
+  return serverErrorMessage(e) ?? GUEST_NAME_LIMIT_NOTE;
 }
 
 /**
@@ -363,16 +398,32 @@ async function parseJson(res: Response): Promise<unknown> {
   }
 }
 
+/**
+ * Error bodies are nested (`{ error: { code, message } }`); read
+ * `error.code` / `error.message`, falling back to a top-level `error` string
+ * (as the code) and top-level `message`.
+ */
 function errorFromBody(status: number, body: unknown): OpenApiError {
   if (body && typeof body === 'object') {
-    const err = (body as { error?: { code?: string; message?: string } }).error;
-    if (err?.message) {
-      return new OpenApiError(status, err.message, err.code, body);
-    }
-    const message = (body as { message?: string }).message;
-    if (typeof message === 'string') {
-      return new OpenApiError(status, message, undefined, body);
-    }
+    const b = body as { error?: unknown; message?: unknown };
+    const nested =
+      b.error && typeof b.error === 'object'
+        ? (b.error as { code?: unknown; message?: unknown })
+        : undefined;
+    const code =
+      typeof nested?.code === 'string'
+        ? nested.code
+        : typeof b.error === 'string'
+          ? b.error
+          : undefined;
+    const message =
+      typeof nested?.message === 'string' && nested.message.length > 0
+        ? nested.message
+        : typeof b.message === 'string' && b.message.length > 0
+          ? b.message
+          : undefined;
+    if (message) return new OpenApiError(status, message, code, body);
+    if (code) return new OpenApiError(status, `Open API error (${status})`, code, body);
   }
   return new OpenApiError(status, `Open API error (${status})`, undefined, body);
 }
