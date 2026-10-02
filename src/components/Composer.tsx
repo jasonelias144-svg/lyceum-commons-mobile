@@ -8,8 +8,14 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { isSlowDown, slowDownNote } from '../api/openClient';
+import {
+  OpenApiError,
+  isSlowDown,
+  slowDownNote,
+  slowDownSecondsLeft,
+} from '../api/openClient';
 import { colors } from '../theme/colors';
+import { useWaitClock } from './useWaitClock';
 
 type Props = {
   onSend: (body: string) => Promise<void> | void;
@@ -21,6 +27,20 @@ export function Composer({ onSend, disabled, bottomInset = 0 }: Props) {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  /**
+   * Server slow-down (429) on a send. While its wait runs, send is disabled
+   * and the note counts down (or shows the server's own text); the draft is
+   * kept and never re-sent automatically. Cleared when the wait ends.
+   */
+  const [slow, setSlow] = useState<OpenApiError | null>(null);
+  const now = useWaitClock(slow?.retryUntilMs);
+  const waitLeft = slow ? slowDownSecondsLeft(slow, now) : 0;
+  const waiting = waitLeft > 0;
+
+  // Wait over: drop the timed note and let the user send again.
+  useEffect(() => {
+    if (slow && slow.retryUntilMs != null && !waiting) setSlow(null);
+  }, [slow, waiting]);
 
   /**
    * In-flight guard (sync, unlike `sending` state): a second send while a
@@ -30,20 +50,27 @@ export function Composer({ onSend, disabled, bottomInset = 0 }: Props) {
   const inFlightRef = useRef(false);
 
   const canSend =
-    !disabled && !sending && draft.trim().length > 0 && draft.length <= 4000;
+    !disabled && !sending && !waiting && draft.trim().length > 0 && draft.length <= 4000;
 
   async function handleSend() {
     const body = draft.trim();
-    if (!body || sending || disabled || inFlightRef.current) return;
+    if (!body || sending || disabled || waiting || inFlightRef.current) return;
     inFlightRef.current = true;
     setSending(true);
     try {
       await onSend(body);
       setDraft('');
       setSendError(null);
+      setSlow(null);
     } catch (e) {
-      // Server slow-down: keep the text, show its note plainly; send stays live.
-      setSendError(isSlowDown(e) ? slowDownNote(e) : "Couldn't send. Try again.");
+      if (isSlowDown(e)) {
+        // Keep the text. With a named wait, send stays off until it passes.
+        setSlow(e as OpenApiError);
+        setSendError(null);
+      } else {
+        setSlow(null);
+        setSendError("Couldn't send. Try again.");
+      }
     } finally {
       inFlightRef.current = false;
       setSending(false);
@@ -53,7 +80,11 @@ export function Composer({ onSend, disabled, bottomInset = 0 }: Props) {
   function onChangeDraft(text: string) {
     setDraft(text);
     if (sendError) setSendError(null);
+    // An untimed slow-down note clears on edit; a timed one stays until its wait ends.
+    if (slow && slow.retryUntilMs == null) setSlow(null);
   }
+
+  const note = slow ? slowDownNote(slow, now) : sendError;
 
   const inputRef = useRef<TextInput | null>(null);
   const [inputHost, setInputHost] = useState<TextInput | null>(null);
@@ -103,7 +134,7 @@ export function Composer({ onSend, disabled, bottomInset = 0 }: Props) {
       style={[styles.wrap, { paddingBottom: Math.max(10, bottomInset) }]}
       pointerEvents="box-none"
     >
-      {sendError ? <Text style={styles.sendError}>{sendError}</Text> : null}
+      {note ? <Text style={styles.sendError}>{note}</Text> : null}
       <View style={styles.pill}>
         <Pressable
           accessibilityRole="button"
