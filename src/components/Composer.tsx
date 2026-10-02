@@ -10,6 +10,14 @@ import {
 } from 'react-native';
 import { colors } from '../theme/colors';
 
+/** Minimum gap between user-initiated posts (Jason's call). */
+export const POST_GAP_MS = 1000;
+
+/** ms left before another user send is allowed (0 = may send now). */
+export function postGapRemaining(lastAttemptAt: number, now: number): number {
+  return Math.max(0, POST_GAP_MS - (now - lastAttemptAt));
+}
+
 type Props = {
   onSend: (body: string) => Promise<void> | void;
   disabled?: boolean;
@@ -20,13 +28,50 @@ export function Composer({ onSend, disabled, bottomInset = 0 }: Props) {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  /**
+   * 1s gap between user sends. Only user sends go through here; the silent
+   * rejoin retry inside onSend is not gated. A send inside the window keeps
+   * the text and greys send until the window ends.
+   */
+  const lastAttemptAtRef = useRef(0);
+  const [coolingDown, setCoolingDown] = useState(false);
+  const cooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function startCooldown(ms: number) {
+    if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
+    setCoolingDown(true);
+    cooldownTimerRef.current = setTimeout(() => {
+      cooldownTimerRef.current = null;
+      setCoolingDown(false);
+    }, ms);
+  }
+
+  useEffect(
+    () => () => {
+      if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
+    },
+    [],
+  );
 
   const canSend =
-    !disabled && !sending && draft.trim().length > 0 && draft.length <= 4000;
+    !disabled &&
+    !sending &&
+    !coolingDown &&
+    draft.trim().length > 0 &&
+    draft.length <= 4000;
 
   async function handleSend() {
     const body = draft.trim();
     if (!body || sending || disabled) return;
+    const now = Date.now();
+    const wait = postGapRemaining(lastAttemptAtRef.current, now);
+    if (wait > 0) {
+      // Too soon: keep the draft, grey send for the rest of the window.
+      startCooldown(wait);
+      return;
+    }
+    lastAttemptAtRef.current = now;
+    startCooldown(POST_GAP_MS);
     setSending(true);
     try {
       await onSend(body);
