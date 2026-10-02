@@ -8,6 +8,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { isSlowDown, slowDownNote } from '../api/openClient';
 import { colors } from '../theme/colors';
 
 type Props = {
@@ -21,20 +22,30 @@ export function Composer({ onSend, disabled, bottomInset = 0 }: Props) {
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
 
+  /**
+   * In-flight guard (sync, unlike `sending` state): a second send while a
+   * user post is in flight — double tap, rapid Enter — is a no-op. The
+   * silent-rejoin retry runs inside the same onSend, so it isn't blocked.
+   */
+  const inFlightRef = useRef(false);
+
   const canSend =
     !disabled && !sending && draft.trim().length > 0 && draft.length <= 4000;
 
   async function handleSend() {
     const body = draft.trim();
-    if (!body || sending || disabled) return;
+    if (!body || sending || disabled || inFlightRef.current) return;
+    inFlightRef.current = true;
     setSending(true);
     try {
       await onSend(body);
       setDraft('');
       setSendError(null);
-    } catch {
-      setSendError("Couldn't send. Try again.");
+    } catch (e) {
+      // Server slow-down: keep the text, show its note plainly; send stays live.
+      setSendError(isSlowDown(e) ? slowDownNote(e) : "Couldn't send. Try again.");
     } finally {
+      inFlightRef.current = false;
       setSending(false);
     }
   }

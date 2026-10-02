@@ -78,6 +78,15 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
   const lastMessageIdRef = useRef<string | undefined>(undefined);
   const leftForBackgroundRef = useRef(false);
   const sessionActiveRef = useRef(true);
+  /**
+   * Leave in flight or sent (button, Leave anyway, unload). Set — and polling
+   * stopped — BEFORE the leave is awaited or fired, so a poll landing after
+   * the leave (403 not_joined) can't silently rejoin a ghost member.
+   */
+  const leavingRef = useRef(false);
+  /** Wall time the latest leave began; 403s from polls started earlier are ignored. */
+  const leaveStartedAtRef = useRef(0);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   /** Wall time of the latest post send start — stale polls begun before this skip turn. */
   const lastPostAtRef = useRef(0);
   /** Latest turn we applied (ref so poll can compare without stale closure). */
@@ -111,6 +120,20 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
   const onIdentityLostRef = useRef(onIdentityLost);
   onIdentityLostRef.current = onIdentityLost;
 
+  /**
+   * Silent rejoin is allowed only in a live, foreground session: never while
+   * leaving / after leave, or while backgrounded (AppState not 'active').
+   */
+  const canSilentRejoin = useCallback(
+    () =>
+      mountedRef.current &&
+      sessionActiveRef.current &&
+      !leavingRef.current &&
+      !leftForBackgroundRef.current &&
+      AppState.currentState === 'active',
+    [],
+  );
+
   /** Stop polling and hand back to the join screen (name prefilled by App). */
   const exitToJoin = useCallback((note: string) => {
     if (!sessionActiveRef.current) return;
@@ -128,6 +151,8 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
   const recoverIdentity = useCallback(
     async (startGen: number): Promise<RejoinOutcome> => {
       if (!sessionActiveRef.current) return 'exited';
+      // Leaving / left / backgrounded: no rejoin, and no exit-to-join either.
+      if (!canSilentRejoin()) return 'exited';
       const inFlight = rejoinInFlightRef.current;
       if (inFlight) return inFlight;
       // A rejoin already landed after this call was sent — just carry on.
@@ -152,7 +177,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       rejoinInFlightRef.current = attempt;
       return attempt;
     },
-    [roomId, handle, exitToJoin],
+    [roomId, handle, exitToJoin, canSilentRejoin],
   );
 
   /** A call started under `startGen` succeeded — the rejoin (if any) stuck. */
@@ -177,6 +202,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
             : undefined;
         const res = await listMessages(roomId, handle, after);
         if (!mountedRef.current || !sessionActiveRef.current) return;
+        if (leavingRef.current || startedAt < leaveStartedAtRef.current) return;
         markIdentityOk(startGen);
 
         if (after) {
@@ -262,7 +288,10 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
         }
       } catch (e) {
         if (!mountedRef.current || !sessionActiveRef.current) return;
+        // Poll began before a leave, or we're leaving: drop it (its 403 is ours).
+        if (leavingRef.current || startedAt < leaveStartedAtRef.current) return;
         if (isIdentityLoss(e)) {
+          if (!canSilentRejoin()) return;
           // Expired / key not accepted: silent rejoin, no error banner. On
           // success poll again right away; the `after` cursor is untouched so
           // nothing is duplicated, and meta goes through the usual atomic path.
@@ -289,23 +318,47 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
         if (mountedRef.current && opts?.initial) setLoading(false);
       }
     },
-    [roomId, handle, scrollToEndQuiet, recoverIdentity, markIdentityOk],
+    [roomId, handle, scrollToEndQuiet, recoverIdentity, markIdentityOk, canSilentRejoin],
   );
+
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
+
+  const stopPolling = useCallback(() => {
+    if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+    pollTimerRef.current = null;
+  }, []);
+
+  const startPolling = useCallback(() => {
+    if (pollTimerRef.current) return;
+    pollTimerRef.current = setInterval(() => {
+      if (
+        sessionActiveRef.current &&
+        !leavingRef.current &&
+        !leftForBackgroundRef.current
+      ) {
+        void refreshRef.current();
+      }
+    }, POLL_MS);
+  }, []);
+
+  /** Mark leaving and stop polling — call BEFORE awaiting / firing a leave. */
+  const beginLeave = useCallback(() => {
+    leavingRef.current = true;
+    leaveStartedAtRef.current = Date.now();
+    stopPolling();
+  }, [stopPolling]);
 
   useEffect(() => {
     mountedRef.current = true;
     sessionActiveRef.current = true;
     void refresh({ initial: true });
-    const id = setInterval(() => {
-      if (sessionActiveRef.current && !leftForBackgroundRef.current) {
-        void refresh();
-      }
-    }, POLL_MS);
+    startPolling();
     return () => {
       mountedRef.current = false;
-      clearInterval(id);
+      stopPolling();
     };
-  }, [refresh]);
+  }, [refresh, startPolling, stopPolling]);
 
   // Web: best-effort leave on pagehide / beforeunload — once per unload (both
   // events fire on a normal close; a second leave would only 403). A page
@@ -316,10 +369,15 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
     const leaveOnce = () => {
       if (sent || !sessionActiveRef.current) return;
       sent = true;
+      beginLeave();
       leaveRoomBestEffort(roomId, handle);
     };
     const onPageShow = () => {
+      if (!sent) return;
       sent = false;
+      // Restored from bfcache: resume; the next poll silently rejoins.
+      leavingRef.current = false;
+      if (sessionActiveRef.current) startPolling();
     };
     if (typeof window !== 'undefined') {
       window.addEventListener('pagehide', leaveOnce);
@@ -332,7 +390,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       };
     }
     return undefined;
-  }, [roomId, handle]);
+  }, [roomId, handle, beginLeave, startPolling]);
 
   // Native: leave on background; silent rejoin on active.
   useEffect(() => {
@@ -340,7 +398,10 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
     const onChange = (next: AppStateStatus) => {
       if (next === 'background' || next === 'inactive') {
         if (!leftForBackgroundRef.current && sessionActiveRef.current) {
+          // Pause polling and mark left before the leave is fired.
           leftForBackgroundRef.current = true;
+          leaveStartedAtRef.current = Date.now();
+          stopPolling();
           leaveRoomBestEffort(roomId, handle);
         }
       } else if (next === 'active') {
@@ -354,6 +415,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
               rejoinUnverifiedRef.current = false;
               leftForBackgroundRef.current = false;
               setRejoinError(null);
+              startPolling();
               await refresh({ full: true });
             } catch (e) {
               if (!mountedRef.current) return;
@@ -376,7 +438,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
     };
     const sub = AppState.addEventListener('change', onChange);
     return () => sub.remove();
-  }, [roomId, handle, refresh, exitToJoin]);
+  }, [roomId, handle, refresh, exitToJoin, startPolling, stopPolling]);
 
   function onScroll(e: NativeSyntheticEvent<NativeScrollEvent>) {
     const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
@@ -396,6 +458,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       rejoinUnverifiedRef.current = false;
       leftForBackgroundRef.current = false;
       setRejoinError(null);
+      startPolling();
       await refresh({ full: true });
     } catch (e) {
       if (!mountedRef.current) return;
@@ -456,7 +519,8 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
   }
 
   async function handleLeave() {
-    if (leaving) return;
+    if (leaving || leavingRef.current) return;
+    beginLeave();
     setLeaving(true);
     setLeaveError(null);
     try {
@@ -467,6 +531,9 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       onLeave();
     } catch (e) {
       if (!mountedRef.current) return;
+      // Still in the room: resume polling.
+      leavingRef.current = false;
+      if (sessionActiveRef.current) startPolling();
       const msg =
         e instanceof OpenApiError
           ? e.message
@@ -479,6 +546,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
   }
 
   function handleLeaveAnyway() {
+    beginLeave();
     sessionActiveRef.current = false;
     leftForBackgroundRef.current = false;
     leaveRoomBestEffort(roomId, handle);

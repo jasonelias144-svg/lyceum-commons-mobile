@@ -216,6 +216,10 @@ export class OpenApiError extends Error {
   readonly status: number;
   readonly code?: string;
   readonly payload?: unknown;
+  /** Seconds from a Retry-After header, when the response carried one. */
+  retryAfterSec?: number;
+  /** True when the failing request carried an X-Lyceum-Guest key. */
+  sentGuestKey?: boolean;
 
   constructor(status: number, message: string, code?: string, payload?: unknown) {
     super(message);
@@ -232,6 +236,30 @@ export function isHandleTaken(e: unknown): boolean {
 }
 
 /**
+ * Copy for a 409 on join. The held-name note only when we sent a guest key
+ * (the server has guest identity, so handle_taken means another key holds
+ * it). Keyless (e.g. a server without guest identity, where a lookalike-name
+ * 409 means something else): the server's own JSON `message`, then `error`
+ * (string, or `error.message`), else the held note.
+ */
+export function handleConflictNote(e: unknown): string {
+  if (!(e instanceof OpenApiError)) return HELD_NAME_NOTE;
+  if (e.sentGuestKey && isHandleTaken(e)) return HELD_NAME_NOTE;
+  const p = e.payload && typeof e.payload === 'object' ? (e.payload as Record<string, unknown>) : {};
+  const err = p.error;
+  const fromErr =
+    typeof err === 'string'
+      ? err
+      : err && typeof err === 'object'
+        ? (err as { message?: unknown }).message
+        : undefined;
+  for (const v of [p.message, fromErr]) {
+    if (typeof v === 'string' && v.trim().length > 0) return v.trim();
+  }
+  return HELD_NAME_NOTE;
+}
+
+/**
  * Lost identity for this name: not present in the room any more (403
  * not_joined, e.g. presence expiry) or the key was not accepted (401
  * guest_key_required). A silent rejoin with the stored key can fix either.
@@ -242,6 +270,73 @@ export function isIdentityLoss(e: unknown): boolean {
     (e.status === 403 && e.code === 'not_joined') ||
     (e.status === 401 && e.code === 'guest_key_required')
   );
+}
+
+/** Error codes treated as the server's slow-down (alongside any HTTP 429). */
+export const SLOW_DOWN_CODES = ['rate_limited', 'slow_down', 'too_many_requests'];
+
+/** Fallback copy when a slow-down carries no note of its own. */
+export const SLOW_DOWN_FALLBACK = 'Slow down a moment, then send again.';
+
+function slowDownPayload(e: OpenApiError): Record<string, unknown> {
+  const p = e.payload;
+  return p && typeof p === 'object' ? (p as Record<string, unknown>) : {};
+}
+
+/**
+ * Server slow-down on a post: HTTP 429, or a JSON `error` (string or
+ * `{ code }`) of rate_limited / slow_down / too_many_requests. Not identity
+ * loss — the caller keeps the text and shows {@link slowDownNote}.
+ */
+export function isSlowDown(e: unknown): boolean {
+  if (!(e instanceof OpenApiError)) return false;
+  if (e.status === 429) return true;
+  const err = slowDownPayload(e).error;
+  const code =
+    typeof err === 'string'
+      ? err
+      : err && typeof err === 'object'
+        ? (err as { code?: unknown }).code
+        : e.code;
+  return typeof code === 'string' && SLOW_DOWN_CODES.includes(code.toLowerCase());
+}
+
+/**
+ * Plain one-line note for a slow-down: JSON `message`, then `note`, then
+ * `error_description` (top level, then inside an `error` object), else the
+ * fallback. Appends "(try again in Ns)" from Retry-After / retry_after (s) /
+ * retry_after_ms when present.
+ */
+export function slowDownNote(e: unknown): string {
+  if (!(e instanceof OpenApiError)) return SLOW_DOWN_FALLBACK;
+  const p = slowDownPayload(e);
+  const nested =
+    p.error && typeof p.error === 'object' ? (p.error as Record<string, unknown>) : {};
+  const pick = (o: Record<string, unknown>) =>
+    [o.message, o.note, o.error_description].find(
+      (v): v is string => typeof v === 'string' && v.trim().length > 0,
+    );
+  const text = (pick(p) ?? pick(nested) ?? SLOW_DOWN_FALLBACK).trim();
+  let secs: number | undefined;
+  const num = (v: unknown) =>
+    typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
+  const ms = num(p.retry_after_ms ?? nested.retry_after_ms);
+  const s = num(p.retry_after ?? nested.retry_after);
+  if (Number.isFinite(ms) && ms > 0) secs = ms / 1000;
+  else if (Number.isFinite(s) && s > 0) secs = s;
+  else if (e.retryAfterSec != null && e.retryAfterSec > 0) secs = e.retryAfterSec;
+  return secs ? `${text} (try again in ${Math.ceil(secs)}s)` : text;
+}
+
+/** Retry-After header → seconds (delta-seconds or HTTP-date); undefined if absent/bad. */
+function parseRetryAfter(raw: string | null): number | undefined {
+  if (!raw) return undefined;
+  const n = Number(raw.trim());
+  if (Number.isFinite(n)) return n > 0 ? n : undefined;
+  const at = Date.parse(raw);
+  if (!Number.isFinite(at)) return undefined;
+  const secs = (at - Date.now()) / 1000;
+  return secs > 0 ? secs : undefined;
 }
 
 function apiBase(): string {
@@ -311,7 +406,10 @@ async function request<T>(
   const res = await fetch(url, { method, headers, body });
   const parsed = await parseJson(res);
   if (!res.ok) {
-    throw errorFromBody(res.status, parsed);
+    const err = errorFromBody(res.status, parsed);
+    err.retryAfterSec = parseRetryAfter(res.headers.get('Retry-After'));
+    err.sentGuestKey = Boolean(guestKey);
+    throw err;
   }
   return parsed as T;
 }

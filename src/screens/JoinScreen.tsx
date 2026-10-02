@@ -11,11 +11,10 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
-  HELD_NAME_NOTE,
   OpenApiError,
   WELCOME_ROOM_ID,
   getApiBase,
-  isHandleTaken,
+  handleConflictNote,
   joinRoom,
   sanitizeHandle,
 } from '../api/openClient';
@@ -46,13 +45,14 @@ export function JoinScreen({ onJoined, initialHandle, initialNote }: Props) {
       await joinRoom(WELCOME_ROOM_ID, trimmed);
       onJoined(trimmed, WELCOME_ROOM_ID);
     } catch (e) {
-      const msg = isHandleTaken(e)
-        ? HELD_NAME_NOTE
-        : e instanceof OpenApiError
-          ? e.message
-          : e instanceof Error
+      const msg =
+        e instanceof OpenApiError && e.status === 409
+          ? handleConflictNote(e)
+          : e instanceof OpenApiError
             ? e.message
-            : 'Join failed';
+            : e instanceof Error
+              ? e.message
+              : 'Join failed';
       setError(msg);
     } finally {
       setBusy(false);
