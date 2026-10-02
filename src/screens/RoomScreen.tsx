@@ -18,6 +18,9 @@ import {
   OpenApiError,
   STALE_TURN_HEAL_POLLS,
   formatTurnStatus,
+  guestNameLimitNote,
+  handleConflictNote,
+  isGuestNameLimit,
   isHandleTaken,
   isIdentityLoss,
   joinRoom,
@@ -44,6 +47,27 @@ const POLL_MS = 4000;
 
 /** Rejoin failed for a reason other than a held name. */
 const REJOIN_FAILED_NOTE = "Couldn't rejoin. Join again.";
+
+/**
+ * A rejoin failure that ends the session: 409 handle_taken (copy from
+ * handleConflictNote — keyless shows the server's own message) or 403
+ * guest_name_limit (the server's note). Null for anything retryable.
+ */
+function rejoinExitNote(e: unknown): string | null {
+  if (isHandleTaken(e)) return handleConflictNote(e);
+  if (isGuestNameLimit(e)) return guestNameLimitNote(e);
+  return null;
+}
+
+/**
+ * Identity lost again right after a silent rejoin (the rejoin didn't stick).
+ * Keyed: the held-name note. Keyless: "held" may be wrong, so the server's
+ * own message (via handleConflictNote's fallback), else the held note.
+ */
+function lostAgainNote(e: unknown): string {
+  if (e instanceof OpenApiError && !e.sentGuestKey) return handleConflictNote(e);
+  return HELD_NAME_NOTE;
+}
 
 type Props = {
   roomId: string;
@@ -149,7 +173,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
    * loss before anything succeeds → back to join. No retry loop.
    */
   const recoverIdentity = useCallback(
-    async (startGen: number): Promise<RejoinOutcome> => {
+    async (startGen: number, cause?: unknown): Promise<RejoinOutcome> => {
       if (!sessionActiveRef.current) return 'exited';
       // Leaving / left / backgrounded: no rejoin, and no exit-to-join either.
       if (!canSilentRejoin()) return 'exited';
@@ -158,7 +182,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       // A rejoin already landed after this call was sent — just carry on.
       if (startGen !== rejoinGenRef.current) return 'rejoined';
       if (rejoinUnverifiedRef.current) {
-        exitToJoin(HELD_NAME_NOTE);
+        exitToJoin(lostAgainNote(cause));
         return 'exited';
       }
       const attempt = (async (): Promise<RejoinOutcome> => {
@@ -168,7 +192,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
           rejoinUnverifiedRef.current = true;
           return 'rejoined';
         } catch (e) {
-          exitToJoin(isHandleTaken(e) ? HELD_NAME_NOTE : REJOIN_FAILED_NOTE);
+          exitToJoin(rejoinExitNote(e) ?? REJOIN_FAILED_NOTE);
           return 'exited';
         } finally {
           rejoinInFlightRef.current = null;
@@ -295,7 +319,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
           // Expired / key not accepted: silent rejoin, no error banner. On
           // success poll again right away; the `after` cursor is untouched so
           // nothing is duplicated, and meta goes through the usual atomic path.
-          const outcome = await recoverIdentity(startGen);
+          const outcome = await recoverIdentity(startGen, e);
           if (
             outcome === 'rejoined' &&
             mountedRef.current &&
@@ -419,8 +443,9 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
               await refresh({ full: true });
             } catch (e) {
               if (!mountedRef.current) return;
-              if (isHandleTaken(e)) {
-                exitToJoin(HELD_NAME_NOTE);
+              const exitNote = rejoinExitNote(e);
+              if (exitNote) {
+                exitToJoin(exitNote);
                 return;
               }
               // Flag stays true → poll remains paused while not joined.
@@ -462,8 +487,9 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       await refresh({ full: true });
     } catch (e) {
       if (!mountedRef.current) return;
-      if (isHandleTaken(e)) {
-        exitToJoin(HELD_NAME_NOTE);
+      const exitNote = rejoinExitNote(e);
+      if (exitNote) {
+        exitToJoin(exitNote);
         return;
       }
       const msg =
@@ -486,7 +512,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       return posted;
     } catch (e) {
       if (!isIdentityLoss(e)) throw e;
-      const outcome = await recoverIdentity(startGen);
+      const outcome = await recoverIdentity(startGen, e);
       if (outcome !== 'rejoined') throw e;
       // Retry exactly once. A 403/401 was not stored server-side, so this
       // cannot double-post.
@@ -499,7 +525,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       } catch (e2) {
         if (isIdentityLoss(e2)) {
           // Rejoined but still refused — don't loop.
-          exitToJoin(HELD_NAME_NOTE);
+          exitToJoin(lostAgainNote(e2));
         }
         throw e2;
       }
