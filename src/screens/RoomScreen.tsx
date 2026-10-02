@@ -22,6 +22,7 @@ import {
   isGuestNameLimit,
   isIdentityLoss,
   isNameConflict,
+  isSlowDown,
   joinRoom,
   leaveRoom,
   leaveRoomBestEffort,
@@ -30,6 +31,7 @@ import {
   postMessage,
   serverErrorMessage,
   shouldAcceptTurn,
+  slowDownNote,
   turnFingerprint,
   turnsEqual,
   type OpenMessage,
@@ -39,6 +41,7 @@ import {
 } from '../api/openClient';
 import { Composer } from '../components/Composer';
 import { MessageRow } from '../components/MessageRow';
+import { useWaitClock } from '../components/useWaitClock';
 import { colors } from '../theme/colors';
 import { LIST_BOTTOM_PAD, styles } from './roomScreenStyles';
 
@@ -51,14 +54,41 @@ const REJOIN_FAILED_NOTE = "Couldn't rejoin. Join again.";
 /** In-room banner while a failed silent rejoin waits for the next poll to retry. */
 const REJOIN_RETRYING_NOTE = "Couldn't rejoin yet. Trying again.";
 
+/** Fallback for 403 room_full when the server sends no message. */
+const ROOM_FULL_FALLBACK = 'This room is full right now.';
+
 /**
- * A rejoin failure that ends the session: any 409 (the server's message, else
- * the neutral fallback — see handleConflictNote) or 403 guest_name_limit (the
- * server's note). Null for anything retryable.
+ * A join (re)tried after a leave began came back. It must not re-enter the
+ * room; a best-effort leave has already been sent with the same key/handle.
+ */
+class StaleJoinError extends Error {
+  constructor() {
+    super('stale join after leave');
+    this.name = 'StaleJoinError';
+  }
+}
+
+/**
+ * How a failed (re)join ends. Null = retryable: a network error, a 5xx, or a
+ * 429 slow-down (the client holds the join path until Retry-After passes,
+ * and the next poll tick after that tries again). Anything else is terminal,
+ * with the server's message whenever it sent one:
+ * - any 409 → handleConflictNote (server text, else "That name is in use right now.")
+ * - 403 guest_name_limit → the server's note, else the generic limit note
+ * - 403 room_full → server text, else "This room is full right now."
+ * - any other 4xx → server text, else "Couldn't rejoin. Join again."
  */
 function rejoinExitNote(e: unknown): string | null {
+  if (e instanceof StaleJoinError) return null;
+  if (!(e instanceof OpenApiError)) return null;
+  if (e.status >= 500) return null;
+  if (isSlowDown(e)) return null;
   if (isNameConflict(e)) return handleConflictNote(e);
   if (isGuestNameLimit(e)) return guestNameLimitNote(e);
+  if (e.status === 403 && e.code === 'room_full') {
+    return serverErrorMessage(e) ?? ROOM_FULL_FALLBACK;
+  }
+  if (e.status >= 400) return serverErrorMessage(e) ?? REJOIN_FAILED_NOTE;
   return null;
 }
 
@@ -95,8 +125,14 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
   const [messages, setMessages] = useState<OpenMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  /** A 429 on the poll or rejoin path: banner shows its note / live countdown. */
+  const [slowErr, setSlowErr] = useState<OpenApiError | null>(null);
+  const waitNow = useWaitClock(slowErr?.retryUntilMs);
   const [leaveError, setLeaveError] = useState<string | null>(null);
   const [rejoinError, setRejoinError] = useState<string | null>(null);
+  /** A 429 on Retry / foreground rejoin: the Retry row shows its note / live countdown. */
+  const [rejoinSlow, setRejoinSlow] = useState<OpenApiError | null>(null);
+  const rejoinWaitNow = useWaitClock(rejoinSlow?.retryUntilMs);
   const [leaving, setLeaving] = useState(false);
   const [visibility, setVisibility] = useState<RoomVisibility | string | null>(null);
   const [turn, setTurn] = useState<Turn | null>(null);
@@ -155,6 +191,15 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
    * another, so overlapping polls can't stack rejoins (≤ 1 per poll tick).
    */
   const rejoinFailedAtRef = useRef(0);
+  /** Why the latest retryable rejoin failed (a 429 shows its wait in the banner). */
+  const lastRejoinErrorRef = useRef<unknown>(null);
+  /**
+   * Single-flight for the raw join: the poll rejoin, foreground resume and the
+   * Retry button all share one in-flight join; later callers await it.
+   */
+  const joinInFlightRef = useRef<Promise<void> | null>(null);
+  /** Retry button / foreground resume already running — extra taps are no-ops. */
+  const manualRejoinBusyRef = useRef(false);
   const onIdentityLostRef = useRef(onIdentityLost);
   onIdentityLostRef.current = onIdentityLost;
 
@@ -181,12 +226,50 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
   }, []);
 
   /**
+   * The one place a rejoin's POST /join is sent. Single-flight: while a join
+   * is in flight every caller gets the same promise (so ≤ 1 join at a time
+   * across poll, foreground and Retry). If a leave began (button, Leave
+   * anyway, unload, background) after this join was sent and the join still
+   * comes back 200, the name is left again right away with the same key and
+   * handle, and the caller gets StaleJoinError — it never re-enters the room.
+   * On a real success the rejoin generation is bumped once.
+   */
+  const joinShared = useCallback((): Promise<void> => {
+    const inFlight = joinInFlightRef.current;
+    if (inFlight) return inFlight;
+    const sentAt = Date.now();
+    const p = (async () => {
+      try {
+        await joinRoom(roomId, handle);
+        const leftSince =
+          leavingRef.current ||
+          !sessionActiveRef.current ||
+          leaveStartedAtRef.current >= sentAt;
+        if (leftSince) {
+          // Joined after we left: undo it (key stored by joinRoom is sent).
+          // Wait for that leave so a later fresh join can't be overtaken by it.
+          await leaveRoomBestEffort(roomId, handle);
+          throw new StaleJoinError();
+        }
+        rejoinGenRef.current += 1;
+      } finally {
+        joinInFlightRef.current = null;
+      }
+    })();
+    joinInFlightRef.current = p;
+    return p;
+  }, [roomId, handle]);
+
+  /**
    * A human call made under generation `startGen` (sent at `startedAt`)
    * failed with not_joined / guest_key_required. Rejoin once with the stored
    * handle and key (header added by the client), single-flight.
-   * - 409 or guest_name_limit → back to Join with the note (terminal).
-   * - Any other failure (network, 5xx, …) → 'failed': stay in the room; the
-   *   next poll that hits identity loss tries one rejoin again (like web).
+   * - 409, guest_name_limit, room_full or any other 4xx → back to Join with
+   *   the note (terminal; see rejoinExitNote).
+   * - Network error, 5xx or 429 → 'failed': stay in the room; the next poll
+   *   that hits identity loss tries one rejoin again (like web). After a 429
+   *   the join path is held until Retry-After passes, so no join goes out
+   *   before then.
    * - Identity lost again after a 200 rejoin, before anything succeeded →
    *   back to Join (no rejoin-200 / 403 loop).
    */
@@ -207,16 +290,18 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       }
       const attempt = (async (): Promise<RejoinOutcome> => {
         try {
-          await joinRoom(roomId, handle);
-          rejoinGenRef.current += 1;
+          await joinShared();
           rejoinUnverifiedRef.current = true;
+          lastRejoinErrorRef.current = null;
           return 'rejoined';
         } catch (e) {
+          if (e instanceof StaleJoinError) return 'exited';
           const exitNote = rejoinExitNote(e);
           if (exitNote) {
             exitToJoin(exitNote);
             return 'exited';
           }
+          lastRejoinErrorRef.current = e;
           rejoinFailedAtRef.current = Date.now();
           return 'failed';
         } finally {
@@ -226,7 +311,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       rejoinInFlightRef.current = attempt;
       return attempt;
     },
-    [roomId, handle, exitToJoin, canSilentRejoin],
+    [exitToJoin, canSilentRejoin, joinShared],
   );
 
   /** A call started under `startGen` succeeded — the rejoin (if any) stuck. */
@@ -326,6 +411,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
         }
 
         setError(null);
+        setSlowErr(null);
         if (opts?.initial || opts?.forceScroll || nearBottomRef.current) {
           scrollToEndQuiet(!opts?.initial);
         }
@@ -346,8 +432,16 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
           // nothing is duplicated, and meta goes through the usual atomic path.
           const outcome = await recoverIdentity(startGen, e, startedAt);
           if (outcome === 'failed') {
-            // Still in the room; the next poll tick retries the rejoin.
-            if (mountedRef.current && sessionActiveRef.current) setError(REJOIN_RETRYING_NOTE);
+            // Still in the room; the next poll tick (after any 429 wait) retries.
+            if (mountedRef.current && sessionActiveRef.current) {
+              const why = lastRejoinErrorRef.current;
+              if (isSlowDown(why)) {
+                setSlowErr(why as OpenApiError);
+              } else {
+                setSlowErr(null);
+                setError(REJOIN_RETRYING_NOTE);
+              }
+            }
             return;
           }
           if (
@@ -359,6 +453,11 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
             repolledGenRef.current = rejoinGenRef.current;
             void refresh(opts?.initial ? { initial: true } : undefined);
           }
+          return;
+        }
+        if (isSlowDown(e)) {
+          // Poll 429: no poll goes out until its wait passes (client-held).
+          setSlowErr(e as OpenApiError);
           return;
         }
         const msg =
@@ -424,7 +523,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       if (sent || !sessionActiveRef.current) return;
       sent = true;
       beginLeave();
-      leaveRoomBestEffort(roomId, handle);
+      void leaveRoomBestEffort(roomId, handle);
     };
     const onPageShow = () => {
       if (!sent) return;
@@ -456,44 +555,18 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
           leftForBackgroundRef.current = true;
           leaveStartedAtRef.current = Date.now();
           stopPolling();
-          leaveRoomBestEffort(roomId, handle);
+          void leaveRoomBestEffort(roomId, handle);
         }
       } else if (next === 'active') {
         if (leftForBackgroundRef.current && sessionActiveRef.current) {
           // Keep polling paused (leftForBackgroundRef true) until rejoin succeeds.
-          void (async () => {
-            try {
-              await joinRoom(roomId, handle);
-              if (!mountedRef.current) return;
-              rejoinGenRef.current += 1;
-              rejoinUnverifiedRef.current = false;
-              leftForBackgroundRef.current = false;
-              setRejoinError(null);
-              startPolling();
-              await refresh({ full: true });
-            } catch (e) {
-              if (!mountedRef.current) return;
-              const exitNote = rejoinExitNote(e);
-              if (exitNote) {
-                exitToJoin(exitNote);
-                return;
-              }
-              // Flag stays true → poll remains paused while not joined.
-              const msg =
-                e instanceof OpenApiError
-                  ? e.message
-                  : e instanceof Error
-                    ? e.message
-                    : "Couldn't rejoin. Try again.";
-              setRejoinError(msg);
-            }
-          })();
+          void manualRejoinRef.current();
         }
       }
     };
     const sub = AppState.addEventListener('change', onChange);
     return () => sub.remove();
-  }, [roomId, handle, refresh, exitToJoin, startPolling, stopPolling]);
+  }, [roomId, handle, stopPolling]);
 
   function onScroll(e: NativeSyntheticEvent<NativeScrollEvent>) {
     const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
@@ -505,32 +578,62 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
     }
   }
 
+  /**
+   * Foreground resume and the Retry rejoin button: one shared join (see
+   * joinShared — a poll rejoin already in flight is reused), and taps while
+   * one is running are no-ops. Terminal answers exit to Join; retryable ones
+   * leave polling paused with the Retry row (429: its note / countdown).
+   */
   async function retryRejoin() {
+    if (manualRejoinBusyRef.current) return;
+    manualRejoinBusyRef.current = true;
     try {
-      await joinRoom(roomId, handle);
+      try {
+        await joinShared();
+      } catch (e) {
+        // The shared join was sent before a leave that is over now (e.g. a
+        // poll rejoin in flight across background → active): it was undone,
+        // so send one fresh join while the session is still on.
+        if (
+          !(e instanceof StaleJoinError) ||
+          !mountedRef.current ||
+          !sessionActiveRef.current ||
+          leavingRef.current
+        ) {
+          throw e;
+        }
+        await joinShared();
+      }
       if (!mountedRef.current) return;
-      rejoinGenRef.current += 1;
       rejoinUnverifiedRef.current = false;
       leftForBackgroundRef.current = false;
       setRejoinError(null);
+      setRejoinSlow(null);
       startPolling();
       await refresh({ full: true });
     } catch (e) {
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || e instanceof StaleJoinError) return;
       const exitNote = rejoinExitNote(e);
       if (exitNote) {
         exitToJoin(exitNote);
         return;
       }
-      const msg =
-        e instanceof OpenApiError
+      // Flag stays true → poll remains paused while not joined.
+      setRejoinSlow(isSlowDown(e) ? (e as OpenApiError) : null);
+      const msg = isSlowDown(e)
+        ? slowDownNote(e)
+        : e instanceof OpenApiError
           ? e.message
           : e instanceof Error
             ? e.message
             : "Couldn't rejoin. Try again.";
       setRejoinError(msg);
+    } finally {
+      manualRejoinBusyRef.current = false;
     }
   }
+  const manualRejoinRef = useRef(retryRejoin);
+  manualRejoinRef.current = retryRejoin;
 
   /** POST once; on identity loss rejoin once and retry the same post once. */
   async function postWithRejoin(body: string) {
@@ -544,7 +647,12 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
     } catch (e) {
       if (!isIdentityLoss(e)) throw e;
       const outcome = await recoverIdentity(startGen, e, startedAt);
-      if (outcome !== 'rejoined') throw e;
+      if (outcome !== 'rejoined') {
+        // Rejoin held back by a 429: surface its wait in the Composer.
+        const why = lastRejoinErrorRef.current;
+        if (outcome === 'failed' && isSlowDown(why)) throw why;
+        throw e;
+      }
       // Retry exactly once. A 403/401 was not stored server-side, so this
       // cannot double-post.
       const retryGen = rejoinGenRef.current;
@@ -588,6 +696,15 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       onLeave();
     } catch (e) {
       if (!mountedRef.current) return;
+      if (e instanceof OpenApiError && e.status === 403 && e.code === 'not_joined') {
+        // Already out of the room (e.g. expired while a rejoin was in flight):
+        // that is what Leave wanted. A rejoin that still lands is undone by joinShared.
+        sessionActiveRef.current = false;
+        leftForBackgroundRef.current = false;
+        setLeaving(false);
+        onLeave();
+        return;
+      }
       // Still in the room: resume polling.
       leavingRef.current = false;
       if (sessionActiveRef.current) startPolling();
@@ -606,7 +723,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
     beginLeave();
     sessionActiveRef.current = false;
     leftForBackgroundRef.current = false;
-    leaveRoomBestEffort(roomId, handle);
+    void leaveRoomBestEffort(roomId, handle);
     onLeave();
   }
 
@@ -671,7 +788,11 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
                 <Text style={styles.empty}>No messages yet.</Text>
               }
               ListFooterComponent={
-                error ? <Text style={styles.errorBanner}>{error}</Text> : null
+                slowErr ? (
+                  <Text style={styles.errorBanner}>{slowDownNote(slowErr, waitNow)}</Text>
+                ) : error ? (
+                  <Text style={styles.errorBanner}>{error}</Text>
+                ) : null
               }
             />
           )}
@@ -679,7 +800,9 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
 
         {rejoinError ? (
           <View style={styles.leaveErrorRow}>
-            <Text style={styles.leaveErrorText}>{rejoinError}</Text>
+            <Text style={styles.leaveErrorText}>
+              {rejoinSlow ? slowDownNote(rejoinSlow, rejoinWaitNow) : rejoinError}
+            </Text>
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Retry rejoin"
