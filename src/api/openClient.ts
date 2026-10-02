@@ -222,6 +222,14 @@ export class OpenApiError extends Error {
   readonly payload?: unknown;
   /** Seconds from a Retry-After header, when the response carried one. */
   retryAfterSec?: number;
+  /**
+   * Wall time (ms) before which this path must not be called again: the
+   * longest of the Retry-After header (seconds or HTTP-date) and any body
+   * retry field. Undefined when the response named no wait.
+   */
+  retryUntilMs?: number;
+  /** True when no request was sent: a local wait from an earlier 429 is still running. */
+  localWait?: boolean;
   /** True when the failing request carried an X-Lyceum-Guest key. */
   sentGuestKey?: boolean;
 
@@ -336,14 +344,8 @@ export function isSlowDown(e: unknown): boolean {
   return typeof code === 'string' && SLOW_DOWN_CODES.includes(code.toLowerCase());
 }
 
-/**
- * Plain one-line note for a slow-down: JSON `message`, then `note`, then
- * `error_description` (top level, then inside an `error` object), else the
- * fallback. Appends "(try again in Ns)" from Retry-After / retry_after (s) /
- * retry_after_ms when present.
- */
-export function slowDownNote(e: unknown): string {
-  if (!(e instanceof OpenApiError)) return SLOW_DOWN_FALLBACK;
+/** Text of the server's own slow-down note: `message` / `note` / `error_description`, top level then nested. */
+function slowDownServerText(e: OpenApiError): string | undefined {
   const p = slowDownPayload(e);
   const nested =
     p.error && typeof p.error === 'object' ? (p.error as Record<string, unknown>) : {};
@@ -351,16 +353,63 @@ export function slowDownNote(e: unknown): string {
     [o.message, o.note, o.error_description].find(
       (v): v is string => typeof v === 'string' && v.trim().length > 0,
     );
-  const text = (pick(p) ?? pick(nested) ?? SLOW_DOWN_FALLBACK).trim();
-  let secs: number | undefined;
-  const num = (v: unknown) =>
-    typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
-  const ms = num(p.retry_after_ms ?? nested.retry_after_ms);
-  const s = num(p.retry_after ?? nested.retry_after);
-  if (Number.isFinite(ms) && ms > 0) secs = ms / 1000;
-  else if (Number.isFinite(s) && s > 0) secs = s;
-  else if (e.retryAfterSec != null && e.retryAfterSec > 0) secs = e.retryAfterSec;
-  return secs ? `${text} (try again in ${Math.ceil(secs)}s)` : text;
+  return (pick(nested) ?? pick(p))?.trim();
+}
+
+/** Countdown fallback when the server names a wait but sends no text. */
+export function slowDownCountdown(secs: number): string {
+  return `Slow down \u2014 try again in ${secs}s.`;
+}
+
+/** Whole seconds left on a slow-down wait at `nowMs` (0 when none / passed). */
+export function slowDownSecondsLeft(e: unknown, nowMs = Date.now()): number {
+  if (!(e instanceof OpenApiError) || e.retryUntilMs == null) return 0;
+  return Math.max(0, Math.ceil((e.retryUntilMs - nowMs) / 1000));
+}
+
+/**
+ * Plain one-line note for a slow-down (429): the server's own message
+ * whenever it sent one; otherwise a live countdown ("Slow down — try again in
+ * 12s.") while the wait runs; otherwise {@link SLOW_DOWN_FALLBACK}. Callers
+ * re-render each second while {@link slowDownSecondsLeft} > 0.
+ */
+export function slowDownNote(e: unknown, nowMs = Date.now()): string {
+  if (!(e instanceof OpenApiError)) return SLOW_DOWN_FALLBACK;
+  const text = slowDownServerText(e);
+  if (text) return text;
+  const left = slowDownSecondsLeft(e, nowMs);
+  return left > 0 ? slowDownCountdown(left) : SLOW_DOWN_FALLBACK;
+}
+
+function numField(v: unknown): number {
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string' && v.trim() !== '') return Number(v);
+  return NaN;
+}
+
+/**
+ * Wait (ms) named by a 429 body, if any: `retry_after` / `retryAfter`
+ * (seconds) or `retry_after_ms` / `retryAfterMs` (ms), inside `error` or at
+ * the top level. The longest one found wins.
+ */
+function bodyRetryAfterMs(body: unknown): number | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const top = body as Record<string, unknown>;
+  const nested =
+    top.error && typeof top.error === 'object' ? (top.error as Record<string, unknown>) : {};
+  let best: number | undefined;
+  for (const o of [nested, top]) {
+    for (const [k, scale] of [
+      ['retry_after', 1000],
+      ['retryAfter', 1000],
+      ['retry_after_ms', 1],
+      ['retryAfterMs', 1],
+    ] as const) {
+      const n = numField(o[k]);
+      if (Number.isFinite(n) && n > 0) best = Math.max(best ?? 0, n * scale);
+    }
+  }
+  return best;
 }
 
 /** Retry-After header → seconds (delta-seconds or HTTP-date); undefined if absent/bad. */
@@ -428,11 +477,53 @@ function errorFromBody(status: number, body: unknown): OpenApiError {
   return new OpenApiError(status, `Open API error (${status})`, undefined, body);
 }
 
+/** Request paths a 429 wait applies to (leave is never held back). */
+type WaitPath = 'join' | 'post' | 'poll';
+
+function waitPathOf(method: string, path: string): WaitPath | null {
+  if (method === 'POST' && /\/join$/.test(path)) return 'join';
+  if (method === 'POST' && /\/post$/.test(path)) return 'post';
+  if (method === 'GET' && /\/messages$/.test(path)) return 'poll';
+  return null;
+}
+
+/**
+ * Per-path 429 waits: until `until`, no request goes out on that path; the
+ * caller gets a local 429 (same payload, `localWait`) instead. So every path
+ * (rejoin, post, poll, Join) honours Retry-After without its own timer.
+ */
+const waits: Partial<Record<WaitPath, { until: number; status: number; payload: unknown; message: string; code?: string }>> = {};
+
+function localWaitError(kind: WaitPath, now: number): OpenApiError | null {
+  const w = waits[kind];
+  if (!w) return null;
+  if (now >= w.until) {
+    delete waits[kind];
+    return null;
+  }
+  const err = new OpenApiError(w.status, w.message, w.code, w.payload);
+  err.retryUntilMs = w.until;
+  err.retryAfterSec = (w.until - now) / 1000;
+  err.localWait = true;
+  return err;
+}
+
+/** Test/diagnostic: time (ms) a path is held back until, or 0. */
+export function waitUntilFor(kind: WaitPath): number {
+  const w = waits[kind];
+  return w && w.until > Date.now() ? w.until : 0;
+}
+
 async function request<T>(
   method: string,
   path: string,
   init?: { body?: unknown; query?: Record<string, string | undefined> },
 ): Promise<T> {
+  const kind = waitPathOf(method, path);
+  if (kind) {
+    const held = localWaitError(kind, Date.now());
+    if (held) throw held;
+  }
   let url = openUrl(path);
   if (init?.query) {
     const qs = new URLSearchParams();
@@ -458,8 +549,25 @@ async function request<T>(
   const parsed = await parseJson(res);
   if (!res.ok) {
     const err = errorFromBody(res.status, parsed);
+    const now = Date.now();
     err.retryAfterSec = parseRetryAfter(res.headers.get('Retry-After'));
     err.sentGuestKey = Boolean(guestKey);
+    if (isSlowDown(err)) {
+      const headerMs = err.retryAfterSec != null ? err.retryAfterSec * 1000 : 0;
+      const waitMs = Math.max(headerMs, bodyRetryAfterMs(parsed) ?? 0);
+      if (waitMs > 0) {
+        err.retryUntilMs = now + waitMs;
+        if (kind) {
+          waits[kind] = {
+            until: err.retryUntilMs,
+            status: err.status,
+            payload: err.payload,
+            message: err.message,
+            code: err.code,
+          };
+        }
+      }
+    }
     throw err;
   }
   return parsed as T;
@@ -533,9 +641,11 @@ export async function leaveRoom(
 /**
  * Best-effort leave for unload / background: keepalive fetch carrying the
  * guest key header. (No sendBeacon — beacons cannot set headers.)
- * Synchronous and never throws; fire-and-forget.
+ * Sent synchronously and never throws; fire-and-forget. The returned promise
+ * settles (never rejects) once the request is done, for callers that must
+ * order a later join after it.
  */
-export function leaveRoomBestEffort(roomId: string, handle: string): void {
+export function leaveRoomBestEffort(roomId: string, handle: string): Promise<void> {
   const url = openUrl(`/rooms/${encodeURIComponent(roomId)}/leave`);
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -544,16 +654,18 @@ export function leaveRoomBestEffort(roomId: string, handle: string): void {
   const guestKey = getGuestKeySync();
   if (guestKey) headers[GUEST_HEADER] = guestKey;
   try {
-    fetch(url, {
+    return fetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify({ handle }),
       keepalive: true,
-    }).catch(() => {
-      // ignore — best effort
-    });
+    }).then(
+      () => undefined,
+      () => undefined, // ignore — best effort
+    );
   } catch {
     // ignore — best effort
+    return Promise.resolve();
   }
 }
 
