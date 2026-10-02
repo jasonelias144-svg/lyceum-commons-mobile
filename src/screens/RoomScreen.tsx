@@ -691,6 +691,8 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
     setLeaveError(null);
     try {
       await leaveRoom(roomId, handle);
+      // Left for real: this session's 429 waits end with it.
+      clearWaits();
       sessionActiveRef.current = false;
       leftForBackgroundRef.current = false;
       setLeaving(false);
@@ -700,6 +702,7 @@ export function RoomScreen({ roomId, handle, onLeave, onIdentityLost }: Props) {
       if (e instanceof OpenApiError && e.status === 403 && e.code === 'not_joined') {
         // Already out of the room (e.g. expired while a rejoin was in flight):
         // that is what Leave wanted. A rejoin that still lands is undone by joinShared.
+        clearWaits();
         sessionActiveRef.current = false;
         leftForBackgroundRef.current = false;
         setLeaving(false);
