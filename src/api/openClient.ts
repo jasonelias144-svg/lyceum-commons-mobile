@@ -230,6 +230,8 @@ export class OpenApiError extends Error {
   retryUntilMs?: number;
   /** True when no request was sent: a local wait from an earlier 429 is still running. */
   localWait?: boolean;
+  /** Path whose wait this error set (cleared on Leave / successful join → wait over). */
+  waitKind?: WaitPath;
   /** True when the failing request carried an X-Lyceum-Guest key. */
   sentGuestKey?: boolean;
 
@@ -356,41 +358,69 @@ function slowDownServerText(e: OpenApiError): string | undefined {
   return (pick(nested) ?? pick(p))?.trim();
 }
 
-/** Countdown fallback when the server names a wait but sends no text. */
+/** Countdown when the server names a wait but sends no text. */
 export function slowDownCountdown(secs: number): string {
   return `Slow down \u2014 try again in ${secs}s.`;
 }
 
-/** Whole seconds left on a slow-down wait at `nowMs` (0 when none / passed). */
+/** Longest wait the client ever honours for one 429 (bogus or huge values are clamped). */
+export const MAX_WAIT_MS = 120_000;
+
+/**
+ * Whole seconds left on a slow-down wait at `nowMs`: 0 when none, passed, or
+ * cleared (Leave / successful join, or a newer wait on the same path).
+ */
 export function slowDownSecondsLeft(e: unknown, nowMs = Date.now()): number {
   if (!(e instanceof OpenApiError) || e.retryUntilMs == null) return 0;
+  if (e.waitKind && waits[e.waitKind]?.until !== e.retryUntilMs) return 0;
   return Math.max(0, Math.ceil((e.retryUntilMs - nowMs) / 1000));
 }
 
 /**
- * Plain one-line note for a slow-down (429): the server's own message
- * whenever it sent one; otherwise a live countdown ("Slow down — try again in
- * 12s.") while the wait runs; otherwise {@link SLOW_DOWN_FALLBACK}. Callers
- * re-render each second while {@link slowDownSecondsLeft} > 0.
+ * Plain one-line note for a slow-down (429). With a known wait still
+ * running, it always carries the client's live countdown: the server's
+ * message followed by "Try again in Ns.", or "Slow down — try again in Ns."
+ * when there is no message. With no usable wait: the server's message, else
+ * {@link SLOW_DOWN_FALLBACK}. Callers re-render each second while
+ * {@link slowDownSecondsLeft} > 0.
  */
 export function slowDownNote(e: unknown, nowMs = Date.now()): string {
   if (!(e instanceof OpenApiError)) return SLOW_DOWN_FALLBACK;
   const text = slowDownServerText(e);
-  if (text) return text;
   const left = slowDownSecondsLeft(e, nowMs);
-  return left > 0 ? slowDownCountdown(left) : SLOW_DOWN_FALLBACK;
+  if (left > 0) {
+    if (!text) return slowDownCountdown(left);
+    const sentence = /[.!?\u2026]$/.test(text) ? text : `${text}.`;
+    return `${sentence} Try again in ${left}s.`;
+  }
+  return text ?? SLOW_DOWN_FALLBACK;
 }
 
+/** Plain decimal only ("7", "3.7", " 4 "): no sign, hex, exponent or other forms. */
+const PLAIN_DECIMAL_RE = /^\d+(?:\.\d+)?$/;
+
+/** A positive finite number from a JSON number or a plain-decimal string; NaN otherwise. */
 function numField(v: unknown): number {
-  if (typeof v === 'number') return v;
-  if (typeof v === 'string' && v.trim() !== '') return Number(v);
+  if (typeof v === 'number') return Number.isFinite(v) && v > 0 ? v : NaN;
+  if (typeof v === 'string') {
+    const t = v.trim();
+    if (!PLAIN_DECIMAL_RE.test(t)) return NaN;
+    const n = Number(t);
+    return Number.isFinite(n) && n > 0 ? n : NaN;
+  }
   return NaN;
+}
+
+/** A wait in ms → whole seconds (rounded up), at most {@link MAX_WAIT_MS}; 0 = no wait. */
+function clampWaitMs(ms: number): number {
+  if (!Number.isFinite(ms) || ms <= 0) return 0;
+  return Math.min(MAX_WAIT_MS, Math.ceil(ms / 1000) * 1000);
 }
 
 /**
  * Wait (ms) named by a 429 body, if any: `retry_after` / `retryAfter`
  * (seconds) or `retry_after_ms` / `retryAfterMs` (ms), inside `error` or at
- * the top level. The longest one found wins.
+ * the top level. The longest one found wins (clamped by the caller).
  */
 function bodyRetryAfterMs(body: unknown): number | undefined {
   if (!body || typeof body !== 'object') return undefined;
@@ -412,12 +442,23 @@ function bodyRetryAfterMs(body: unknown): number | undefined {
   return best;
 }
 
-/** Retry-After header → seconds (delta-seconds or HTTP-date); undefined if absent/bad. */
+/** Looks like a number but isn't plain decimal (sign, hex, exponent, …): never a date either. */
+const NUMBERISH_RE = /^[+-]?[\d.]/;
+
+/**
+ * Retry-After header → seconds: plain decimal delta-seconds, or an HTTP-date
+ * in the future. Zero, negative, past, hex / exponent forms and garbage →
+ * undefined (no wait). Not clamped here.
+ */
 function parseRetryAfter(raw: string | null): number | undefined {
   if (!raw) return undefined;
-  const n = Number(raw.trim());
-  if (Number.isFinite(n)) return n > 0 ? n : undefined;
-  const at = Date.parse(raw);
+  const t = raw.trim();
+  if (PLAIN_DECIMAL_RE.test(t)) {
+    const n = Number(t);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  }
+  if (NUMBERISH_RE.test(t)) return undefined;
+  const at = Date.parse(t);
   if (!Number.isFinite(at)) return undefined;
   const secs = (at - Date.now()) / 1000;
   return secs > 0 ? secs : undefined;
@@ -505,7 +546,19 @@ function localWaitError(kind: WaitPath, now: number): OpenApiError | null {
   err.retryUntilMs = w.until;
   err.retryAfterSec = (w.until - now) / 1000;
   err.localWait = true;
+  err.waitKind = kind;
   return err;
+}
+
+/**
+ * Drop every 429 wait (join, post, poll). Called on Leave (button / Leave
+ * anyway) and on a successful join / rejoin, so a wait never outlives the
+ * session it came from. Background / unload leaves keep them.
+ */
+export function clearWaits(): void {
+  delete waits.join;
+  delete waits.post;
+  delete waits.poll;
 }
 
 /** Test/diagnostic: time (ms) a path is held back until, or 0. */
@@ -520,6 +573,8 @@ async function request<T>(
   init?: { body?: unknown; query?: Record<string, string | undefined> },
 ): Promise<T> {
   const kind = waitPathOf(method, path);
+  // Leave (the button) ends the session's waits, whatever it answers.
+  if (method === 'POST' && /\/leave$/.test(path)) clearWaits();
   if (kind) {
     const held = localWaitError(kind, Date.now());
     if (held) throw held;
@@ -554,10 +609,12 @@ async function request<T>(
     err.sentGuestKey = Boolean(guestKey);
     if (isSlowDown(err)) {
       const headerMs = err.retryAfterSec != null ? err.retryAfterSec * 1000 : 0;
-      const waitMs = Math.max(headerMs, bodyRetryAfterMs(parsed) ?? 0);
+      const waitMs = clampWaitMs(Math.max(headerMs, bodyRetryAfterMs(parsed) ?? 0));
       if (waitMs > 0) {
+        err.retryAfterSec = waitMs / 1000;
         err.retryUntilMs = now + waitMs;
         if (kind) {
+          err.waitKind = kind;
           waits[kind] = {
             until: err.retryUntilMs,
             status: err.status,
@@ -570,6 +627,8 @@ async function request<T>(
     }
     throw err;
   }
+  // A successful (re)join starts a fresh session: no wait carries over.
+  if (kind === 'join') clearWaits();
   return parsed as T;
 }
 
