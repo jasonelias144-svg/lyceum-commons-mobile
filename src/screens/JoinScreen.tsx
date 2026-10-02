@@ -18,6 +18,7 @@ import {
   handleConflictNote,
   isGuestNameLimit,
   isNameConflict,
+  clearWaits,
   isSlowDown,
   joinRoom,
   sanitizeHandle,
@@ -59,6 +60,8 @@ export function JoinScreen({ onJoined, initialHandle, initialNote }: Props) {
     try {
       // Resolves only after a newly minted guest key is stored.
       await joinRoom(WELCOME_ROOM_ID, trimmed);
+      // An explicit join starts a fresh session: no earlier 429 wait carries over.
+      clearWaits();
       onJoined(trimmed, WELCOME_ROOM_ID);
     } catch (e) {
       if (isSlowDown(e)) {
