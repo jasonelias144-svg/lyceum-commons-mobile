@@ -7,9 +7,12 @@ import { RoomScreen } from './src/screens/RoomScreen';
 import { colors } from './src/theme/colors';
 
 type Session = { handle: string; roomId: string } | null;
+/** Join screen prefill after the room hands back (e.g. name held). */
+type JoinPrefill = { handle: string; note: string } | null;
 
 export default function App() {
   const [session, setSession] = useState<Session>(null);
+  const [prefill, setPrefill] = useState<JoinPrefill>(null);
 
   return (
     <SafeAreaProvider style={styles.root}>
@@ -19,10 +22,19 @@ export default function App() {
           roomId={session.roomId}
           handle={session.handle}
           onLeave={() => setSession(null)}
+          onIdentityLost={(note) => {
+            setPrefill({ handle: session.handle, note });
+            setSession(null);
+          }}
         />
       ) : (
         <JoinScreen
-          onJoined={(handle, roomId) => setSession({ handle, roomId })}
+          initialHandle={prefill?.handle}
+          initialNote={prefill?.note}
+          onJoined={(handle, roomId) => {
+            setPrefill(null);
+            setSession({ handle, roomId });
+          }}
         />
       )}
     </SafeAreaProvider>

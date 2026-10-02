@@ -14,6 +14,7 @@ import {
   OpenApiError,
   WELCOME_ROOM_ID,
   getApiBase,
+  handleConflictNote,
   joinRoom,
   sanitizeHandle,
 } from '../api/openClient';
@@ -21,12 +22,16 @@ import { colors } from '../theme/colors';
 
 type Props = {
   onJoined: (handle: string, roomId: string) => void;
+  /** Prefill after the room handed back (e.g. the name is held). */
+  initialHandle?: string;
+  /** Short grey note shown under the field (e.g. HELD_NAME_NOTE). */
+  initialNote?: string;
 };
 
-export function JoinScreen({ onJoined }: Props) {
-  const [handle, setHandle] = useState('');
+export function JoinScreen({ onJoined, initialHandle, initialNote }: Props) {
+  const [handle, setHandle] = useState(initialHandle ?? '');
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(initialNote ?? null);
 
   const trimmed = sanitizeHandle(handle);
   const canJoin = trimmed.length > 0 && trimmed.length <= 40 && !busy;
@@ -36,15 +41,18 @@ export function JoinScreen({ onJoined }: Props) {
     setBusy(true);
     setError(null);
     try {
+      // Resolves only after a newly minted guest key is stored.
       await joinRoom(WELCOME_ROOM_ID, trimmed);
       onJoined(trimmed, WELCOME_ROOM_ID);
     } catch (e) {
       const msg =
-        e instanceof OpenApiError
-          ? e.message
-          : e instanceof Error
+        e instanceof OpenApiError && e.status === 409
+          ? handleConflictNote(e)
+          : e instanceof OpenApiError
             ? e.message
-            : 'Join failed';
+            : e instanceof Error
+              ? e.message
+              : 'Join failed';
       setError(msg);
     } finally {
       setBusy(false);
@@ -72,7 +80,10 @@ export function JoinScreen({ onJoined }: Props) {
                 : null,
             ]}
             value={handle}
-            onChangeText={setHandle}
+            onChangeText={(text) => {
+              setHandle(text);
+              if (error) setError(null);
+            }}
             placeholder="Handle"
             placeholderTextColor={colors.placeholder}
             autoCapitalize="none"
