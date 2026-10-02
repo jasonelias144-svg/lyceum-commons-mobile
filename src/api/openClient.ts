@@ -209,8 +209,12 @@ export function turnsEqual(
 /** Consecutive fresh rejected polls before accepting an older/unstamped turn. */
 export const STALE_TURN_HEAL_POLLS = 3;
 
-/** Human name is held by another guest key (join / rejoin). */
-export const HELD_NAME_NOTE = 'That name is held by someone else.';
+/**
+ * Neutral fallback for a 409 whose body carries no usable message. The
+ * client never picks its own wording for a name conflict: whenever the
+ * server sends a message, that is what is shown (same as the web client).
+ */
+export const NAME_IN_USE_FALLBACK = 'That name is in use right now.';
 
 export class OpenApiError extends Error {
   readonly status: number;
@@ -235,10 +239,20 @@ export function isHandleTaken(e: unknown): boolean {
   return e instanceof OpenApiError && e.status === 409 && e.code === 'handle_taken';
 }
 
+/** Any 409 on a join — terminal for a rejoin (no retry); copy from handleConflictNote. */
+export function isNameConflict(e: unknown): boolean {
+  return e instanceof OpenApiError && e.status === 409;
+}
+
+/** A bare machine code such as `handle_taken` — never shown as copy. */
+const ERROR_CODE_RE = /^[a-z0-9_]+$/;
+
 /**
  * The server's own text for an error body. Bodies are nested
  * (`{ error: { code, message } }`): `error.message` first, then a top-level
- * `message`, then a top-level `error` string. Undefined when none is usable.
+ * `message`, then a top-level `error` string — unless that string is a bare
+ * code (`{"error":"handle_taken"}`), which is a code, not copy. Undefined
+ * when none is usable.
  */
 export function serverErrorMessage(e: unknown): string | undefined {
   if (!(e instanceof OpenApiError)) return undefined;
@@ -246,40 +260,26 @@ export function serverErrorMessage(e: unknown): string | undefined {
   const err = p.error;
   const nested =
     err && typeof err === 'object' ? (err as { message?: unknown }).message : undefined;
-  for (const v of [nested, p.message, typeof err === 'string' ? err : undefined]) {
+  const flat =
+    typeof err === 'string' && !ERROR_CODE_RE.test(err.trim()) ? err : undefined;
+  for (const v of [nested, p.message, flat]) {
     if (typeof v === 'string' && v.trim().length > 0) return v.trim();
   }
   return undefined;
 }
 
 /**
- * The server's generic handle_taken wording (a lookalike or another key holds
- * the name). For these a keyed join shows the shorter {@link HELD_NAME_NOTE};
- * any other server text is more specific (e.g. a pre-guest-key name that is
- * still present: "join with it again once it has been away …") and is shown.
- */
-const GENERIC_TAKEN_RE = /^that name, or one that looks the same,/i;
-
-/**
- * Copy for a 409 on join / rejoin.
- * - Keyed handle_taken: the held-name note, unless the server's message is
- *   more specific than its generic wording — then the server's message.
- * - Keyless (no guest key was sent, so "held by someone else" may be wrong):
- *   the server's own message (`error.message`, then `message`), else the
- *   held note.
+ * Copy for any 409 on join / rejoin, keyed or keyless: the server's message
+ * whenever there is one, else {@link NAME_IN_USE_FALLBACK}. No client-side
+ * wording choice and no matching on the server's English.
  */
 export function handleConflictNote(e: unknown): string {
-  if (!(e instanceof OpenApiError)) return HELD_NAME_NOTE;
-  const msg = serverErrorMessage(e);
-  if (e.sentGuestKey && isHandleTaken(e)) {
-    return msg && !GENERIC_TAKEN_RE.test(msg) ? msg : HELD_NAME_NOTE;
-  }
-  return msg ?? HELD_NAME_NOTE;
+  return serverErrorMessage(e) ?? NAME_IN_USE_FALLBACK;
 }
 
 /** Fallback copy for 403 guest_name_limit when the body carries no message. */
 export const GUEST_NAME_LIMIT_NOTE =
-  "You're already using 5 names. Leave one to join with another.";
+  'This device has reached its name limit. Use a name you already have, or leave a room to free one.';
 
 /**
  * 403 guest_name_limit — this guest key already holds the maximum number of
