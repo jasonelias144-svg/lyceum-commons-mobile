@@ -230,7 +230,7 @@ export class OpenApiError extends Error {
   retryUntilMs?: number;
   /** True when no request was sent: a local wait from an earlier 429 is still running. */
   localWait?: boolean;
-  /** Path whose wait this error set (cleared on Leave / successful join → wait over). */
+  /** Path whose wait this error set (cleared on Leave / a Join-screen join → wait over). */
   waitKind?: WaitPath;
   /** True when the failing request carried an X-Lyceum-Guest key. */
   sentGuestKey?: boolean;
@@ -368,7 +368,7 @@ export const MAX_WAIT_MS = 120_000;
 
 /**
  * Whole seconds left on a slow-down wait at `nowMs`: 0 when none, passed, or
- * cleared (Leave / successful join, or a newer wait on the same path).
+ * cleared (Leave / a Join-screen join, or a newer wait on the same path).
  */
 export function slowDownSecondsLeft(e: unknown, nowMs = Date.now()): number {
   if (!(e instanceof OpenApiError) || e.retryUntilMs == null) return 0;
@@ -551,9 +551,11 @@ function localWaitError(kind: WaitPath, now: number): OpenApiError | null {
 }
 
 /**
- * Drop every 429 wait (join, post, poll). Called on Leave (button / Leave
- * anyway) and on a successful join / rejoin, so a wait never outlives the
- * session it came from. Background / unload leaves keep them.
+ * Drop every 429 wait (join, post, poll). Called only when the user ends or
+ * starts a session explicitly: after a Leave that succeeded (or Leave
+ * anyway), and after a join from the Join screen succeeds — so a wait never
+ * outlives the session it came from. Silent / poll / foreground rejoins and
+ * background / unload leaves keep them; so does a failed Leave.
  */
 export function clearWaits(): void {
   delete waits.join;
@@ -573,8 +575,6 @@ async function request<T>(
   init?: { body?: unknown; query?: Record<string, string | undefined> },
 ): Promise<T> {
   const kind = waitPathOf(method, path);
-  // Leave (the button) ends the session's waits, whatever it answers.
-  if (method === 'POST' && /\/leave$/.test(path)) clearWaits();
   if (kind) {
     const held = localWaitError(kind, Date.now());
     if (held) throw held;
@@ -627,8 +627,6 @@ async function request<T>(
     }
     throw err;
   }
-  // A successful (re)join starts a fresh session: no wait carries over.
-  if (kind === 'join') clearWaits();
   return parsed as T;
 }
 
