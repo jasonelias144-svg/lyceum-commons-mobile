@@ -1,41 +1,61 @@
-This is an Expo/React Native mobile application. Prioritize mobile-first patterns, performance, and cross-platform compatibility.
+# Working in Lyceum Commons Mobile
 
-## Expo has changed — do not trust your training data
+This repository follows the policy handbook at
+https://github.com/jasonelias144-svg/policy-handbook. Read its orientation
+(README.md) before your first session here. The rules below add to the
+handbook; they never loosen it.
 
-Expo ships breaking changes every SDK release. APIs you remember are likely renamed, moved, or removed. Before writing any code that touches an Expo, EAS, or React Native API:
+## Every session
 
-1. Read the major version of the `expo` package in `package.json`.
-2. Fetch the matching versioned docs: `https://docs.expo.dev/versions/v<major>.0.0/`
-3. For anything else, fetch https://docs.expo.dev/llms.txt — an index of all Expo docs with corrections to common LLM misconceptions. Follow its links to the specific page you need; never answer from memory.
+1. Read `STATUS.md` and the open pull requests (handbook P1).
+2. Work on a branch; never push to `main` (P3).
+3. End by pushing, updating `STATUS.md` on your branch, and opening or updating
+   the pull request (P1).
 
-## Commands
+## Who decides
 
-Use `bunx` instead of `npx` if the project uses bun (`bun.lock` present).
+The founder decides what this project is for and who works on it. The technical
+lead (Claude) decides everything about the code, and records an approval on
+every pull request before it merges (P4). Intent questions go to the founder (P5).
 
-```bash
-npx expo install <package>  # ALWAYS use instead of npm/yarn/pnpm/bun add — resolves SDK-compatible versions
-npx expo start              # start the dev server
-npx expo lint               # lint
-npx tsc --noEmit            # typecheck
-npx expo-doctor             # diagnose dependency and config issues
-npx expo install --fix      # fix incompatible package versions
-```
+## This repository
 
-Run lint and typecheck before declaring any task done.
+- **What it is:** a thin phone app (Expo, React Native, TypeScript) for the
+  Open layer of Lyceum Commons. The live Open API is the only source of truth;
+  the app keeps no conversation store of its own.
+- **Run:** `npm install`, then `npx expo start` (Expo Go on a phone, or `w` for
+  the web). The server address comes from `EXPO_PUBLIC_API_BASE`; see `.env.example`.
+- **Test:** `npm run typecheck` (TypeScript, no emit). There are no unit tests
+  yet. CI runs the typecheck on every pull request.
+- **Merge method:** squash
+- **Release:** none. The app has not been published to an app store, and has
+  no EAS build profiles. Store publishing is a founder decision: accounts and
+  fees are involved (P6).
+- **Data:** the guest key is kept in `expo-secure-store` on phones and in
+  `localStorage` on the web, and is sent only as the `X-Lyceum-Guest` header.
+  Never log it or put it in a request body.
 
-## Navigation & Routing
+## Rules specific to this repository
 
-- Use **Expo Router** for all navigation. Routes live in `src/app/` — every file there is a screen, `_layout.tsx` files define navigators. Keep non-route code (components, hooks, utils) outside `src/app/`.
-- Import `Link`, `router`, and `useLocalSearchParams` from `expo-router`.
-- Docs: https://docs.expo.dev/router/introduction.md
+- **Expo changes quickly; don't trust your training data.** Before touching an
+  Expo, EAS or React Native API, read the `expo` major version in `package.json`,
+  then the matching docs at `https://docs.expo.dev/versions/v<major>.0.0/`. The
+  index at https://docs.expo.dev/llms.txt lists common mistakes.
+- Add packages with `npx expo install <package>`, which picks versions that
+  match the SDK. Commit the updated `package-lock.json`.
+- `ios/` and `android/` are generated (Continuous Native Generation). Don't
+  create or edit them by hand; configure native behaviour in `app.json`.
+- Expo Go only includes its bundled native modules. A library with other native
+  code needs a development build.
+- Navigation is a plain screen switch in `App.tsx` (`JoinScreen`, `RoomScreen`);
+  the app does not use Expo Router. Moving to Expo Router would be a technical
+  lead decision, made in its own pull request.
+- Follow the server's contract: show the server's own error text (409, 429 and
+  others) and honour `Retry-After`. Never invent limits on the client.
 
-## Building with EAS
+## Always
 
-Use EAS to build, sign, and submit the app in the cloud (`eas build`, `eas submit`) and to ship over-the-air updates (`eas update`) — no local Xcode or Android Studio required. Run EAS CLI as `bunx eas-cli <command>` in Bun projects, or `npx eas-cli@latest <command>` otherwise; substitute that for bare `eas` in docs examples.
-Docs: https://docs.expo.dev/eas/index.md
-
-## Rules
-
-- If `ios/` and `android/` directories do not exist, they are generated (Continuous Native Generation). Never create or edit them by hand — configure native behavior in `app.json` and config plugins.
-- Expo Go only includes its bundled native modules. After adding a library with native code, the app needs a development build: `npx expo run:ios|android` locally, or `eas build --profile development`.
-- Prefer recommended Expo modules over third-party libraries, and check your available skills before adding dependencies. Docs: https://docs.expo.dev/versions/latest/index.md
+- Say who made each change: `Made-by: <name> (AI|human)` in commits, and the
+  "Made by" field in pull requests (P3).
+- No secrets or personal data anywhere in the repository (P8).
+- Report outcomes honestly: what you checked, and what you did not.
