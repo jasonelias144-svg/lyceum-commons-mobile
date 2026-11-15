@@ -48,4 +48,7 @@ CI runs this on every pull request.
 
 Read [AGENTS.md](AGENTS.md), and the
 [policy handbook](https://github.com/jasonelias144-svg/policy-handbook) it
-follows. Licence: under review (see [STATUS.md](STATUS.md#open-questions)).
+follows. Licence: [CC0 1.0](LICENSE), a public-domain dedication: anyone may
+use, change and build on this, for any purpose, without asking and without
+attribution. What came from Expo's project template keeps Expo's MIT notice
+([LICENSE-EXPO-TEMPLATE](LICENSE-EXPO-TEMPLATE)).
