@@ -23,10 +23,6 @@
 
 ## Open questions
 
-- For the founder: `LICENSE` is the MIT licence from Expo's project template,
-  with Expo's company (650 Industries) as copyright holder. It doesn't describe
-  this project. Should it be MIT under your name, another licence, or none for
-  now? (asked 2026-10-27)
 - For the founder: is publishing to the App Store or Google Play part of the
   plan? Both need paid developer accounts. (asked 2026-10-27)
 
@@ -36,6 +32,17 @@
   `m7-wait-keep`). This session cannot delete branches.
 
 ## Log
+
+- 2026-11-15 Claude: licence: CC0 1.0 (`LICENSE`), a public-domain
+  dedication, by the founder's decision of 2026-11-15: "Consider all free
+  and public and use the license we have been using and correct that license
+  when I naively chose the wrong one or none. Always consider it all public
+  if in a public repo." And: "Please ensure the right license is chosen that
+  is essentially a license that says there is no restrictions and all that.
+  No attribution required." The open question on the licence (asked
+  2026-10-27) is closed. Expo's MIT licence, which came with the project
+  template, is kept as `LICENSE-EXPO-TEMPLATE` for whatever came from that
+  template; README.md says so.
 
 - 2026-10-27 Claude: adopted the policy handbook; added CI (typecheck) and a
   lockfile; rewrote the README to match milestones M1 to M7. `npm run
