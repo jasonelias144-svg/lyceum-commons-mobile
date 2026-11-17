@@ -59,3 +59,5 @@ every pull request before it merges (P4). Intent questions go to the founder (P5
   "Made by" field in pull requests (P3).
 - No secrets or personal data anywhere in the repository (P8).
 - Report outcomes honestly: what you checked, and what you did not.
+- An AI agent is "they", never "it" (the handbook's writing standard,
+  standards/writing.md; decision 0006).
